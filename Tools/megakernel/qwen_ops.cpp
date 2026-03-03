@@ -109,30 +109,6 @@ torch::Tensor decode(
     return output_token_id;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BUG-1 FIX (Critical — caused 100% request failure):
-//
-// The original generate_nosync() allocated its own output_log internally:
-//
-//     auto output_log = torch::zeros({num_steps}, ...);
-//
-// and the CUDA C function launch_ldg_generate_nosync() takes output_log as
-// its 22nd argument (between bmax_idxs and num_layers).
-//
-// Meanwhile, Qwen06B_architecture.py _gen_args() was passing a caller-supplied
-// output_log tensor as argument 22. Because the pybind binding had NO output_log
-// parameter, every argument after bmax_idxs shifted by one:
-//
-//   Python arg 22 (output_log tensor) → C++ saw it as num_layers (int) → TORCH_CHECK fail
-//   Python arg 23 (NUM_LAYERS int)    → C++ saw it as start_position (int)
-//   ... etc.
-//
-// The TORCH_CHECK type mismatch produced the massive tensor-repr error string.
-//
-// Fix: accept output_log as a parameter, validate it, pass data_ptr through.
-// The caller (Qwen06B_architecture.py) pre-allocates and pre-fills with -1
-// sentinel, so no allocation is needed here.
-// ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor generate_nosync(
     int first_token_id,
     int num_steps,
@@ -202,7 +178,7 @@ torch::Tensor generate_nosync(
         norm_out.data_ptr(),
         bmax_vals.data_ptr(),
         bmax_idxs.data_ptr(),
-        output_log.data_ptr<int>(),   // BUG-1 FIX: pass caller's buffer through
+        output_log.data_ptr<int>(), 
         num_layers,
         start_position,
         max_seq_len,

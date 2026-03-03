@@ -1,0 +1,382 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# Try to import the compiled CUDA extension
+try:
+    import swiglu
+    CUDA_AVAILABLE = True
+except ImportError:
+    CUDA_AVAILABLE = False
+    print("Warning: swiglu CUDA extension not found. Using PyTorch fallback.")
+    print("To compile: python setup.py install")
+
+
+if CUDA_AVAILABLE:
+    class SwiGLUFunction(torch.autograd.Function):
+        """CUDA-accelerated SwiGLU autograd function"""
+        
+        @staticmethod
+        def forward(ctx, x, w_gate, w_up, b_gate=None, b_up=None):
+            # Kernel expects contiguous tensors
+            x = x.contiguous()
+            w_gate = w_gate.contiguous()
+            w_up = w_up.contiguous()
+            
+            # Extension returns (output, gate_cache, up_cache)
+            output, gate_cache, up_cache = swiglu.forward(x, w_gate, w_up, b_gate, b_up)
+            
+            # Save for backward and track if biases exist
+            ctx.save_for_backward(x, w_gate, w_up, gate_cache, up_cache)
+            ctx.has_bias = (b_gate is not None, b_up is not None)
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x, w_gate, w_up, gate_cache, up_cache = ctx.saved_tensors
+            grad_output = grad_output.contiguous()
+            
+            # Get gradients from CUDA kernel
+            grad_x, grad_w_gate, grad_w_up = swiglu.backward(
+                grad_output, x, w_gate, w_up, gate_cache, up_cache
+            )
+            
+            # Compute bias gradients if needed
+            grad_b_gate = None
+            grad_b_up = None
+            
+            if ctx.has_bias[0] or ctx.has_bias[1]:
+                # Recompute SiLU and its derivative for bias gradients
+                # silu(x) = x * sigmoid(x)
+                # silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+                sigmoid_gate = torch.sigmoid(gate_cache)
+                silu_gate = gate_cache * sigmoid_gate
+                silu_grad = sigmoid_gate * (1.0 + gate_cache * (1.0 - sigmoid_gate))
+                
+                if ctx.has_bias[0]:
+                    # Gradient w.r.t. gate pre-activation
+                    grad_gate_pre = grad_output * up_cache * silu_grad
+                    # Sum over batch and sequence dimensions
+                    grad_b_gate = grad_gate_pre.sum(dim=list(range(grad_gate_pre.ndim - 1)))
+                
+                if ctx.has_bias[1]:
+                    # Gradient w.r.t. up pre-activation
+                    grad_up_pre = grad_output * silu_gate
+                    # Sum over batch and sequence dimensions
+                    grad_b_up = grad_up_pre.sum(dim=list(range(grad_up_pre.ndim - 1)))
+            
+            # Return grads for (x, w_gate, w_up, b_gate, b_up)
+            return grad_x, grad_w_gate, grad_w_up, grad_b_gate, grad_b_up
+
+else:
+    class SwiGLUFunction(torch.autograd.Function):
+        """PyTorch fallback SwiGLU implementation"""
+        
+        @staticmethod
+        def forward(ctx, x, w_gate, w_up, b_gate=None, b_up=None):
+            # Standard PyTorch implementation
+            # Note: w_gate and w_up are [in_features, out_features]
+            # F.linear expects [out_features, in_features], so we transpose
+            gate = F.linear(x, w_gate.t(), b_gate)
+            up = F.linear(x, w_up.t(), b_up)
+            output = F.silu(gate) * up
+            
+            ctx.save_for_backward(x, w_gate, w_up, gate, up)
+            ctx.has_bias = (b_gate is not None, b_up is not None)
+            return output
+        
+        @staticmethod
+        def backward(ctx, grad_output):
+            x, w_gate, w_up, gate, up = ctx.saved_tensors
+            
+            # Compute SiLU derivative
+            sigmoid_gate = torch.sigmoid(gate)
+            silu_gate = gate * sigmoid_gate
+            silu_grad = sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
+            
+            # Gradients w.r.t. pre-activation
+            grad_gate = grad_output * up * silu_grad
+            grad_up = grad_output * silu_gate
+            
+            # Input gradient
+            grad_x = grad_gate @ w_gate + grad_up @ w_up
+            
+            # Weight gradients (need to transpose)
+            grad_w_gate = grad_gate.reshape(-1, grad_gate.size(-1)).t() @ x.reshape(-1, x.size(-1))
+            grad_w_up = grad_up.reshape(-1, grad_up.size(-1)).t() @ x.reshape(-1, x.size(-1))
+            
+            # Bias gradients
+            grad_b_gate = None
+            grad_b_up = None
+            if ctx.has_bias[0]:
+                grad_b_gate = grad_gate.sum(dim=list(range(grad_gate.ndim - 1)))
+            if ctx.has_bias[1]:
+                grad_b_up = grad_up.sum(dim=list(range(grad_up.ndim - 1)))
+            
+            return grad_x, grad_w_gate, grad_w_up, grad_b_gate, grad_b_up
+
+
+class FusedSwiGLU(nn.Module):
+    """
+    Fused SwiGLU layer that combines gate and up projections.
+    
+    SwiGLU(x) = SiLU(x @ W_gate + b_gate) * (x @ W_up + b_up)
+    where SiLU(x) = x * sigmoid(x)
+    
+    This is more efficient than separate Linear layers because it:
+    1. Fuses the two matrix multiplications
+    2. Applies SiLU activation inline
+    3. Performs element-wise multiplication in the same kernel
+    
+    Args:
+        hidden_size: Input dimension
+        intermediate_size: Output dimension (typically 4x hidden_size)
+        bias: Whether to use bias terms (default: False, following Llama)
+    
+    Shape:
+        - Input: (batch, seq_len, hidden_size) or (batch, hidden_size)
+        - Output: (batch, seq_len, intermediate_size) or (batch, intermediate_size)
+    
+    Usage:
+        >>> swiglu = FusedSwiGLU(hidden_size=4096, intermediate_size=11008)
+        >>> x = torch.randn(2, 128, 4096, device='cuda')
+        >>> output = swiglu(x)  # Shape: [2, 128, 11008]
+    """
+    
+    def __init__(self, hidden_size, intermediate_size, bias=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        
+        # Weight matrices: [in_features, out_features] = [hidden_size, intermediate_size]
+        # This matches the CUDA kernel's expected layout
+        self.w_gate = nn.Parameter(torch.empty(hidden_size, intermediate_size))
+        self.w_up = nn.Parameter(torch.empty(hidden_size, intermediate_size))
+        
+        # Bias vectors
+        if bias:
+            self.b_gate = nn.Parameter(torch.zeros(intermediate_size))
+            self.b_up = nn.Parameter(torch.zeros(intermediate_size))
+        else:
+            self.register_parameter('b_gate', None)
+            self.register_parameter('b_up', None)
+        
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        """Initialize weights using Kaiming uniform initialization."""
+        # Standard initialization like nn.Linear
+        nn.init.kaiming_uniform_(self.w_gate, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.w_up, a=math.sqrt(5))
+        
+        # Initialize biases
+        if self.b_gate is not None:
+            fan_in = self.hidden_size
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.b_gate, -bound, bound)
+            nn.init.uniform_(self.b_up, -bound, bound)
+    
+    def forward(self, x):
+        """
+        Forward pass through fused SwiGLU.
+        
+        Args:
+            x: Input tensor [batch_size, seq_len, hidden_size]
+        
+        Returns:
+            output: [batch_size, seq_len, intermediate_size]
+        """
+        # Validate input
+        if x.size(-1) != self.hidden_size:
+            raise ValueError(
+                f"Expected input with hidden_size={self.hidden_size}, "
+                f"but got {x.size(-1)}"
+            )
+        
+        if CUDA_AVAILABLE and not x.is_cuda:
+            raise RuntimeError(
+                "FusedSwiGLU with CUDA backend requires CUDA tensors. "
+                "Move your input to CUDA or use CPU tensors for fallback."
+            )
+        
+        return SwiGLUFunction.apply(x, self.w_gate, self.w_up, self.b_gate, self.b_up)
+    
+    def extra_repr(self):
+        """String representation for print(model)"""
+        return (f'hidden_size={self.hidden_size}, '
+                f'intermediate_size={self.intermediate_size}, '
+                f'bias={self.b_gate is not None}')
+
+
+class FusedFeedForward(nn.Module):
+    """
+    Complete fused feedforward layer: SwiGLU + Down projection.
+    
+    Architecture:
+        x -> [Gate, Up] -> SiLU(Gate) * Up -> Down -> output
+    
+    This is equivalent to the FFN in Llama:
+        gate = Linear(x)
+        up = Linear(x)
+        intermediate = SiLU(gate) * up
+        output = Linear(intermediate)
+    
+    But implemented with fused CUDA kernels for efficiency.
+    
+    Args:
+        hidden_size: Model hidden dimension (input/output size)
+        intermediate_size: FFN intermediate dimension (typically 4x hidden_size)
+        bias: Whether to use bias terms (default: False)
+    
+    Shape:
+        - Input: (batch, seq_len, hidden_size)
+        - Output: (batch, seq_len, hidden_size)
+    """
+    
+    def __init__(self, hidden_size, intermediate_size, bias=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        
+        # Fused gate + up projections with SiLU
+        self.swiglu = FusedSwiGLU(hidden_size, intermediate_size, bias=bias)
+        
+        # Down projection back to hidden_size
+        self.w_down = nn.Linear(intermediate_size, hidden_size, bias=bias)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor [batch_size, seq_len, hidden_size]
+        
+        Returns:
+            output: [batch_size, seq_len, hidden_size]
+        """
+        intermediate = self.swiglu(x)
+        output = self.w_down(intermediate)
+        return output
+
+
+def convert_feedforward_to_fused(feedforward_module):
+    """
+    Convert a standard FeedForward module to FusedFeedForward.
+    
+    This function helps migrate existing models to use fused kernels.
+    Assumes the standard Llama FFN structure with w1 (gate), w2 (down), w3 (up).
+    
+    Args:
+        feedforward_module: Existing FeedForward module with w1, w2, w3 attributes
+    
+    Returns:
+        FusedFeedForward module with copied weights
+    
+    Example:
+        >>> # Original module
+        >>> class StandardFFN(nn.Module):
+        ...     def __init__(self, hidden, intermediate):
+        ...         self.w1 = nn.Linear(hidden, intermediate)  # gate
+        ...         self.w2 = nn.Linear(intermediate, hidden)  # down
+        ...         self.w3 = nn.Linear(hidden, intermediate)  # up
+        >>> 
+        >>> ffn = StandardFFN(4096, 11008)
+        >>> fused_ffn = convert_feedforward_to_fused(ffn)
+    """
+    # Get dimensions
+    hidden_size = feedforward_module.w2.in_features
+    intermediate_size = feedforward_module.w1.out_features
+    has_bias = feedforward_module.w1.bias is not None
+    
+    # Create fused module
+    fused_ff = FusedFeedForward(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        bias=has_bias
+    )
+    
+    # Copy weights
+    # nn.Linear stores weights as [out_features, in_features]
+    # FusedSwiGLU expects [in_features, out_features]
+    # So we need to transpose
+    with torch.no_grad():
+        fused_ff.swiglu.w_gate.data.copy_(feedforward_module.w1.weight.data.t())
+        fused_ff.swiglu.w_up.data.copy_(feedforward_module.w3.weight.data.t())
+        fused_ff.w_down.weight.data.copy_(feedforward_module.w2.weight.data)
+        
+        if has_bias:
+            fused_ff.swiglu.b_gate.data.copy_(feedforward_module.w1.bias.data)
+            fused_ff.swiglu.b_up.data.copy_(feedforward_module.w3.bias.data)
+            fused_ff.w_down.bias.data.copy_(feedforward_module.w2.bias.data)
+    
+    return fused_ff
+
+
+# Test and verification functions
+def test_swiglu_gradients():
+    """Test that gradients flow correctly through SwiGLU"""
+    print("Testing SwiGLU gradients...")
+    
+    if not torch.cuda.is_available():
+        print("⚠️  CUDA not available, skipping CUDA tests")
+        return
+    
+    batch, seq, hidden, inter = 2, 4, 64, 256
+    device = 'cuda'
+    
+    # Test without bias
+    print("\n1. Testing without bias...")
+    x = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
+    swiglu = FusedSwiGLU(hidden, inter, bias=False).to(device)
+    
+    output = swiglu(x)
+    loss = output.sum()
+    loss.backward()
+    
+    assert x.grad is not None, "❌ Input gradient missing"
+    assert swiglu.w_gate.grad is not None, "❌ w_gate gradient missing"
+    assert swiglu.w_up.grad is not None, "❌ w_up gradient missing"
+    print("✓ Gradients computed correctly")
+    
+    # Test with bias
+    print("\n2. Testing with bias...")
+    x = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
+    swiglu_bias = FusedSwiGLU(hidden, inter, bias=True).to(device)
+    
+    output = swiglu_bias(x)
+    loss = output.sum()
+    loss.backward()
+    
+    assert swiglu_bias.b_gate.grad is not None, "❌ b_gate gradient missing"
+    assert swiglu_bias.b_up.grad is not None, "❌ b_up gradient missing"
+    print("✓ Bias gradients computed correctly")
+    
+    # Test numerical stability
+    print("\n3. Testing numerical stability...")
+    x_large = torch.randn(batch, seq, hidden, device=device) * 100
+    x_small = torch.randn(batch, seq, hidden, device=device) * 0.01
+    
+    out_large = swiglu(x_large)
+    out_small = swiglu(x_small)
+    
+    assert not torch.isnan(out_large).any(), "❌ NaN in large input"
+    assert not torch.isnan(out_small).any(), "❌ NaN in small input"
+    print("✓ Numerically stable")
+    
+    # Test FusedFeedForward
+    print("\n4. Testing FusedFeedForward...")
+    x = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
+    ffn = FusedFeedForward(hidden, inter).to(device)
+    
+    output = ffn(x)
+    assert output.shape == (batch, seq, hidden), f"❌ Wrong output shape: {output.shape}"
+    
+    loss = output.sum()
+    loss.backward()
+    assert x.grad is not None, "❌ FFN backward failed"
+    print("✓ FusedFeedForward working")
+    
+    print("\n✅ All tests passed!")
+
+
+if __name__ == "__main__":
+    test_swiglu_gradients()

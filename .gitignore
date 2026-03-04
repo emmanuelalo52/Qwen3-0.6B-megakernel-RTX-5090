@@ -15,4 +15,5 @@
 /vllm_full.nsys-rep
 /vllm_server_profile2.nsys-rep
 /vllm_server_profile_100.nsys-rep
-/vllm_single_v3.nsys-rep
+/vllm_single_v3.nsys-repModel/*.safetensors
+Model/*.bin

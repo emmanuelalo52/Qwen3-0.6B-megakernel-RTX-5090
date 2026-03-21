@@ -2,8 +2,10 @@ import asyncio
 import os
 import time
 import itertools
+from contextlib import asynccontextmanager
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+
 
 def load_env(path: str = ".env") -> None:
     env_path = Path(path)
@@ -16,6 +18,7 @@ def load_env(path: str = ".env") -> None:
                 continue
             key, _, val = line.partition("=")
             os.environ.setdefault(key.strip(), val.strip())
+
 
 load_env()
 
@@ -32,17 +35,14 @@ from pydantic import BaseModel
 from typing import Optional
 import uvicorn
 
-app = FastAPI(title="Qwen Megakernel Server", default_response_class=ORJSONResponse)
-
 decoder   = None
 _executor = ThreadPoolExecutor(max_workers=1)
 
-# counter instead of uuid4()
 _req_counter = itertools.count(1)
 
-# cached timestamp
 _cached_ts    = int(time.time())
 _cached_ts_at = time.monotonic()
+
 
 def _get_ts() -> int:
     global _cached_ts, _cached_ts_at
@@ -53,8 +53,9 @@ def _get_ts() -> int:
     return _cached_ts
 
 
-@app.on_event("startup")
-async def load_model():
+# I replaced deprecated @app.on_event("startup") with the lifespan context manager — required by FastAPI >= 0.93.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global decoder
     print(f"[megakernel_server] Loading {MODEL_NAME} with megakernel...", flush=True)
     t0 = time.time()
@@ -62,11 +63,21 @@ async def load_model():
     decoder = Decoder(model_name=MODEL_NAME, verbose=True)
     print(f"[megakernel_server] Model loaded in {time.time()-t0:.1f}s", flush=True)
     print(f"[megakernel_server] Serving on port {PORT}", flush=True)
+    yield
+    # Shutdown: nothing to clean up (CUDA context released with process)
+
+
+app = FastAPI(
+    title="Qwen Megakernel Server",
+    default_response_class=ORJSONResponse,
+    lifespan=lifespan,
+)
 
 
 class Message(BaseModel):
     role: str
     content: str
+
 
 class ChatRequest(BaseModel):
     model: str
@@ -92,11 +103,11 @@ async def models():
 
 def _build_prompt(messages: list[Message]) -> str:
     import re as _re
-    msgs = [{"role": m.role, "content": m.content} for m in messages]
+    msgs   = [{"role": m.role, "content": m.content} for m in messages]
     prompt = decoder.tokenizer.apply_chat_template(
         msgs, tokenize=False, add_generation_prompt=True
     )
-
+    # Suppress Qwen3 chain-of-thought — strip existing <think> block and inject an empty one so the model skips the thinking phase.
     prompt = _re.sub(r'<think>.*?</think>\n*', '', prompt, flags=_re.DOTALL)
     prompt = prompt.rstrip() + '\n<think>\n\n</think>\n\n'
     return prompt

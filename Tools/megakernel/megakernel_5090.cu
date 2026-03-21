@@ -308,7 +308,8 @@ __device__ void ldg_prefetch_weights_l2(const half *weights, int num_elements) {
     int num_vec = num_elements / 8;
     for (int i = threadIdx.x; i < num_vec; i += LDG_BLOCK_SIZE) {
         uint4 dummy = ldg_load_weights_u4(reinterpret_cast<const uint4*>(weights) + i);
-        asm volatile("" : : "r"(dummy.x), "r"(dummy.y), "r"(dummy.z), "r"(dummy.w));
+        // Clobber registers so the compiler cannot eliminate the load
+        asm volatile("" : : "r"(dummy.x), "r"(dummy.y), "r"(dummy.z), "r"(dummy.w) : "memory");
     }
 }
 
@@ -442,18 +443,23 @@ __device__ void ldg_attention(
 
     // prefetch weights into L2 while block 0 / attn blocks work
     if (block_id >= LDG_ATTN_BLOCKS) {
-        int prefetch_id        = block_id - LDG_ATTN_BLOCKS;
+        int prefetch_id         = block_id - LDG_ATTN_BLOCKS;
         int num_prefetch_blocks = LDG_NUM_BLOCKS - LDG_ATTN_BLOCKS;
-        int total_elements = HIDDEN_SIZE * Q_SIZE + HIDDEN_SIZE * INTERMEDIATE_SIZE * 3;
-        int per_block      = (total_elements + num_prefetch_blocks - 1) / num_prefetch_blocks;
+        int total_elements      = HIDDEN_SIZE * Q_SIZE + INTERMEDIATE_SIZE * HIDDEN_SIZE * 3;
+        int per_block = (total_elements + num_prefetch_blocks - 1) / num_prefetch_blocks;
         int start = prefetch_id * per_block;
         int end   = min(start + per_block, total_elements);
 
-        for (int i = start + threadIdx.x; i < end; i += LDG_BLOCK_SIZE) {
-            const half *ptr = (i < HIDDEN_SIZE * Q_SIZE)
-                            ? (o_w + i)
-                            : (g_w + (i - HIDDEN_SIZE * Q_SIZE));
-            (void)ptr;
+        // Walk using vec4 loads (8 halfs = 16 bytes per load)
+        int vec_start = start / 8;
+        int vec_end   = end   / 8;
+        for (int i = vec_start + threadIdx.x; i < vec_end; i += LDG_BLOCK_SIZE) {
+            int elem = i * 8;
+            const uint4 *ptr = (elem < HIDDEN_SIZE * Q_SIZE)
+                ? (reinterpret_cast<const uint4*>(o_w) + i)
+                : (reinterpret_cast<const uint4*>(g_w) + (i - HIDDEN_SIZE * Q_SIZE / 8));
+            uint4 dummy = ldg_load_weights_u4(ptr);
+            asm volatile("" : : "r"(dummy.x), "r"(dummy.y), "r"(dummy.z), "r"(dummy.w) : "memory");
         }
     }
 
@@ -521,8 +527,8 @@ __device__ void ldg_attention(
             __syncthreads();
 
             if (warp_id == 0) {
-                int nw = min(LDG_NUM_WARPS, (cache_len + LDG_NUM_WARPS - 1));
-                nw = min(nw, LDG_NUM_WARPS);  // cap at the number of warps
+                int nw = min(LDG_NUM_WARPS, (cache_len + LDG_NUM_WARPS - 1));  // missing / LDG_NUM_WARPS
+                nw = min(nw, LDG_NUM_WARPS);
 
                 // Find global maximum across all warps.
                 float g_max = -INFINITY;
@@ -566,9 +572,10 @@ __device__ void ldg_o_proj_postnorm_mlp(
     const half *__restrict__ up_weight,
     const half *__restrict__ down_weight,
     const half *__restrict__ attn_out,
-    float      *__restrict__ g_residual,      // pre-attn residual (float)
-    float      *__restrict__ g_activations,   // scratch: post-o-proj hidden (float)
+    const half *__restrict__ hidden_residual,   // FIX 3: half* not float*
+    float      *__restrict__ g_activations,
     float      *__restrict__ g_mlp_intermediate,
+    float      *__restrict__ g_norm_scratch,    // FIX 5: 1-float global scratch
     half       *__restrict__ hidden_out)      // final output written as half
 {
     int block_id  = blockIdx.x;
@@ -609,30 +616,34 @@ __device__ void ldg_o_proj_postnorm_mlp(
         }
         sum = ldg_warp_reduce_sum(sum);
         if (lane_id == 0)
-            g_activations[m] = sum + g_residual[m];  // fuse residual add
+            g_activations[m] = sum + __half2float(hidden_residual[m]);  // fuse residual add
     }
 
     grid.sync();
 
-    // Post-attention RMSNorm (replicated across blocks to avoid extra sync)
+    // Post-attention RMSNorm (replicate block 0 across the rest of the block to reduce redundancy)
     {
-        __shared__ float s_sum_sq;
-        if (threadIdx.x == 0) s_sum_sq = 0.0f;
-        __syncthreads();
-
-        float local_ss = 0.0f;
-        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-            float val = g_activations[i];
-            s_act[i]  = __float2half(val);
-            local_ss += val * val;
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
+            s_act[i] = __float2half(g_activations[i]);
+        if(block_id == 0){
+            __shared__ float s_norm_sq;
+            if(threadIdx.x == 0) s_norm_sq = 0.0f;
+            __syncthreads();
+            float local_ss = 0.0f;
+            for(int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE){
+                float val = g_activations[i];
+                local_ss += val* val;
+            }
+            local_ss = ldg_warp_reduce_sum(local_ss);
+            if(lane_id == 0 ) atomicAdd(&s_norm_sq,local_ss);
+            __syncthreads();
+            if(threadIdx.x == 0)
+                *g_norm_scratch = rsqrtf(s_norm_sq / (float)HIDDEN_SIZE + LDG_RMS_EPS);
         }
-        local_ss = ldg_warp_reduce_sum(local_ss);
-        if (lane_id == 0) atomicAdd(&s_sum_sq, local_ss);
-        __syncthreads();
-
-        float rstd = rsqrtf(s_sum_sq / (float)HIDDEN_SIZE + LDG_RMS_EPS);
-        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-            float w  = __half2float(post_norm_weight[i]);
+        grid.sync();
+        float rstd = *g_norm_scratch;
+        for(int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE){
+            float w = __half2float(post_norm_weight[i]);
             s_act[i] = __float2half(__half2float(s_act[i]) * rstd * w);
         }
         __syncthreads();
@@ -684,22 +695,19 @@ __device__ void ldg_o_proj_postnorm_mlp(
         for (int k = lane_id; k < INTERMEDIATE_SIZE / 8; k += WARP_SIZE) {
             uint4  d_u4 = ldg_load_weights_u4(d_row + k);
             half2 *dh   = reinterpret_cast<half2*>(&d_u4);
-            int    base = k * 8;
+            // int    base = k * 8;
             // Use __ldg for read-only cached loads from global memory
-            float m0 = __ldg(g_mlp_intermediate + base + 0);
-            float m1 = __ldg(g_mlp_intermediate + base + 1);
-            float m2 = __ldg(g_mlp_intermediate + base + 2);
-            float m3 = __ldg(g_mlp_intermediate + base + 3);
-            float m4 = __ldg(g_mlp_intermediate + base + 4);
-            float m5 = __ldg(g_mlp_intermediate + base + 5);
-            float m6 = __ldg(g_mlp_intermediate + base + 6);
-            float m7 = __ldg(g_mlp_intermediate + base + 7);
+            float4 mi0 = *reinterpret_cast<const float4*>(g_mlp_intermediate + k * 8);
+            float4 mi1 = *reinterpret_cast<const float4*>(g_mlp_intermediate + k * 8 + 4);
+
             float2 d0 = __half22float2(dh[0]);
             float2 d1 = __half22float2(dh[1]);
             float2 d2 = __half22float2(dh[2]);
             float2 d3 = __half22float2(dh[3]);
-            sum += d0.x*m0 + d0.y*m1 + d1.x*m2 + d1.y*m3
-                 + d2.x*m4 + d2.y*m5 + d3.x*m6 + d3.y*m7;
+            sum += d0.x*mi0.x + d0.y*mi0.y
+                 + d1.x*mi0.z + d1.y*mi0.w
+                 + d2.x*mi1.x + d2.y*mi1.y
+                 + d3.x*mi1.z + d3.y*mi1.w;
         }
         sum = ldg_warp_reduce_sum(sum);
         if (lane_id == 0)
@@ -721,12 +729,18 @@ static int          *h_pinned_position  = nullptr;
 static int          *h_pinned_token_id  = nullptr;
 
 // Prefill statics: allocated once on first prefill call.
+static int   *d_eos_flag     = nullptr;
+static float *d_norm_scratch = nullptr;
+
 static int *d_prefill_dummy_log    = nullptr;
 static int *d_prefill_step_counter = nullptr;
 static int *d_prefill_output_token = nullptr;
-
-static int *d_prefill_token_ids     = nullptr;
+static int *d_prefill_token_ids    = nullptr;
 static int  d_prefill_token_ids_cap = 0;
+
+static int *h_pinned_positions     = nullptr;
+static int  h_pinned_positions_cap = 0;
+
 
 static void ensure_barrier_alloc() {
     if (d_barrier_counter) return;
@@ -742,6 +756,12 @@ static void ensure_barrier_alloc() {
     cudaMemset(d_barrier_sense,   0, sizeof(unsigned int));
     cudaMemset(d_kv_flag,         0, sizeof(unsigned int));
     cudaMemset(d_attn_flag,       0, sizeof(unsigned int));
+
+    cudaMalloc(&d_eos_flag, sizeof(int));
+    cudaMemset(d_eos_flag, 0, sizeof(int));
+
+    cudaMalloc(&d_norm_scratch, sizeof(float));
+    cudaMemset(d_norm_scratch, 0, sizeof(float));
 }
 
 
@@ -756,6 +776,8 @@ __global__ void ldg_update_step(
     int       *__restrict__ d_eos_flag,   // set to 1 when EOS is generated
     int                     eos_token_id)
 {
+    if(*d_eos_flag) return;
+
     int tok  = *lm_output;
     int step = *d_step_counter;
     *d_token_id       = tok;
@@ -778,13 +800,14 @@ __device__ void ldg_decode_body(
     const half *cos_table,
     const half *sin_table,
     half       *k_cache,    half *v_cache,
-    half       *hidden_buffer,       // half residual stream
-    float      *g_activations,       // float scratch (post-o-proj hidden)
-    float      *g_residual,          // float scratch (pre-attn residual)
+    half       *hidden_buffer,
+    float      *g_activations,
     half       *g_q, half *g_k, half *g_v,
     half       *g_attn_out,
     float      *g_mlp_intermediate,
     float      *g_normalized,
+    float      *g_norm_scratch,   // FIX 5: norm scalar scratch
+    int        *d_eos_flag,       // FIX 1: early-exit check
     int         num_layers,
     int         position,
     int         input_token_id,
@@ -792,6 +815,8 @@ __device__ void ldg_decode_body(
     float       attn_scale,
     AtomicGridSync &grid)
 {
+    if(*d_eos_flag) return;
+    
     int tid     = threadIdx.x;
     int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
@@ -872,9 +897,9 @@ __device__ void ldg_decode_body(
             lw.up_proj_weight, lw.down_proj_weight);
 
         // Prepare residual for o-proj
-        for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
-            g_residual[i] = __half2float(hidden_buffer[i]);
-        grid.sync();
+        // for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
+        //     g_residual[i] = __half2float(hidden_buffer[i]);
+        // grid.sync();
 
         // O-proj + Post-norm + MLP
         ldg_o_proj_postnorm_mlp(
@@ -885,9 +910,10 @@ __device__ void ldg_decode_body(
             lw.up_proj_weight,
             lw.down_proj_weight,
             g_attn_out,
-            g_residual,
+            hidden_buffer,    // FIX 3: half* residual, direct — no float intermediate
             g_activations,
             g_mlp_intermediate,
+            g_norm_scratch,   // FIX 5: norm scalar scratch
             hidden_buffer);
     }
 
@@ -932,11 +958,13 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_direct(
     const half           *sin_table,
     half *k_cache, half *v_cache,
     half *hidden_buffer,
-    float *g_activations, float *g_residual,
+    float *g_activations, float *g_residual,   // g_residual kept for ABI compat
     half *g_q, half *g_k, half *g_v,
     half *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
+    float *g_norm_scratch,
     unsigned int *barrier_counter, unsigned int *barrier_sense,
     unsigned int *kv_flag, unsigned int *attn_flag,
+    int *d_eos_flag,
     int num_layers, int position, int input_token_id,
     int max_seq_len, float attn_scale)
 {
@@ -949,8 +977,9 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_direct(
         embed_weight, layer_weights, final_norm_weight,
         cos_table, sin_table,
         k_cache, v_cache, hidden_buffer,
-        g_activations, g_residual,
+        g_activations,
         g_q, g_k, g_v, g_attn_out, g_mlp_intermediate, g_normalized,
+        g_norm_scratch, d_eos_flag,
         num_layers, position, input_token_id, max_seq_len, attn_scale,
         grid);
 }
@@ -963,11 +992,13 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_persistent(
     const half           *sin_table,
     half *k_cache, half *v_cache,
     half *hidden_buffer,
-    float *g_activations, float *g_residual,
+    float *g_activations, float *g_residual,   // g_residual kept for ABI compat
     half *g_q, half *g_k, half *g_v,
     half *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
+    float *g_norm_scratch,
     unsigned int *barrier_counter, unsigned int *barrier_sense,
     unsigned int *kv_flag, unsigned int *attn_flag,
+    int *d_eos_flag,
     int num_layers, const int *d_position, const int *d_token_id,
     int max_seq_len, float attn_scale)
 {
@@ -980,8 +1011,9 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_persistent(
         embed_weight, layer_weights, final_norm_weight,
         cos_table, sin_table,
         k_cache, v_cache, hidden_buffer,
-        g_activations, g_residual,
+        g_activations,
         g_q, g_k, g_v, g_attn_out, g_mlp_intermediate, g_normalized,
+        g_norm_scratch, d_eos_flag,
         num_layers, *d_position, *d_token_id, max_seq_len, attn_scale,
         grid);
 }
@@ -1137,6 +1169,7 @@ __global__ void __launch_bounds__(LDG_LM_BLOCK_SIZE, 1) ldg_lm_head_phase2(
 
 // Launch functions (C linkage for Python extension)
 
+static inline void ldg_configure_kernel_attributes();
 
 // Helper: launch a cooperative kernel (hardware grid sync)
 extern "C" void launch_ldg_decode_direct(
@@ -1145,7 +1178,7 @@ extern "C" void launch_ldg_decode_direct(
     const void *final_norm_weight, const void *lm_head_weight,
     const void *cos_table, const void *sin_table,
     void *k_cache, void *v_cache, void *hidden_buffer,
-    void *g_activations, void *g_residual,
+    void *g_activations, void *g_residual,     // g_residual: ABI compat, unused
     void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized,
     void *block_max_vals, void *block_max_idxs,
@@ -1156,6 +1189,8 @@ extern "C" void launch_ldg_decode_direct(
     ensure_barrier_alloc();
 
     cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
+    cudaMemsetAsync(d_barrier_sense,   0, sizeof(unsigned int), stream);
+    cudaMemsetAsync(d_eos_flag,        0, sizeof(int),          stream);
 
     ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
         (const half*)embed_weight, layer_weights,
@@ -1166,10 +1201,12 @@ extern "C" void launch_ldg_decode_direct(
         (float*)g_activations, (float*)g_residual,
         (half*)g_q, (half*)g_k, (half*)g_v,
         (half*)g_attn_out, (float*)g_mlp_intermediate, (float*)g_normalized,
+        d_norm_scratch,
         d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag,
+        d_eos_flag,
         num_layers, position, input_token_id, max_seq_len, attn_scale);
 
-    cudaStreamSynchronize(stream);
+    // cudaStreamSynchronize(stream);
 
     ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float*)g_normalized, (const half*)lm_head_weight,
@@ -1186,7 +1223,7 @@ extern "C" void launch_ldg_decode_persistent(
     const void *final_norm_weight, const void *lm_head_weight,
     const void *cos_table, const void *sin_table,
     void *k_cache, void *v_cache, void *hidden_buffer,
-    void *g_activations, void *g_residual,
+    void *g_activations, void *g_residual,     // ABI compat, unused
     void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized,
     void *block_max_vals, void *block_max_idxs,
@@ -1203,7 +1240,10 @@ extern "C" void launch_ldg_decode_persistent(
     cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
                     cudaMemcpyHostToDevice, stream);
 
+    // Reset both barrier fields
     cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
+    cudaMemsetAsync(d_barrier_sense,   0, sizeof(unsigned int), stream);
+    cudaMemsetAsync(d_eos_flag,        0, sizeof(int),          stream);
 
     ldg_decode_kernel_persistent<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
         (const half*)embed_weight, layer_weights,
@@ -1214,11 +1254,13 @@ extern "C" void launch_ldg_decode_persistent(
         (float*)g_activations, (float*)g_residual,
         (half*)g_q, (half*)g_k, (half*)g_v,
         (half*)g_attn_out, (float*)g_mlp_intermediate, (float*)g_normalized,
+        d_norm_scratch,
         d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag,
+        d_eos_flag,
         num_layers, d_mutable_position, d_mutable_token_id,
         max_seq_len, attn_scale);
 
-    cudaStreamSynchronize(stream);
+    // cudaStreamSynchronize(stream);
 
     ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float*)g_normalized, (const half*)lm_head_weight,
@@ -1257,12 +1299,21 @@ extern "C" void launch_ldg_prefill(
         cudaMalloc(&d_prefill_output_token, sizeof(int));
     }
 
-    // BUG-2 FIX: grow-only static buffer — no per-request malloc/free
+    // Grow-only static buffer — no per-request malloc/free
     if (num_tokens > d_prefill_token_ids_cap) {
         if (d_prefill_token_ids) cudaFree(d_prefill_token_ids);
         cudaMalloc(&d_prefill_token_ids, num_tokens * sizeof(int));
         d_prefill_token_ids_cap = num_tokens;
     }
+    // Grow-only pinned positions array for safe async copies
+    if (num_tokens > h_pinned_positions_cap) {
+        if (h_pinned_positions) cudaFreeHost(h_pinned_positions);
+        cudaHostAlloc(&h_pinned_positions, num_tokens * sizeof(int), cudaHostAllocDefault);
+        h_pinned_positions_cap = num_tokens;
+    }
+    // Prefill all positions before any async copies begin
+    for(int t = 0; t < num_tokens; t++)
+        h_pinned_positions[t] = start_position + t;
 
     // Copy all token ids to device in one transfer
     cudaMemcpyAsync(d_prefill_token_ids, token_ids, num_tokens * sizeof(int),
@@ -1274,10 +1325,10 @@ extern "C" void launch_ldg_prefill(
         // Reset barrier for this step (stream-ordered, no CPU stall)
         cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
         cudaMemsetAsync(d_barrier_sense,   0, sizeof(unsigned int), stream);
+        cudaMemsetAsync(d_eos_flag,        0, sizeof(int),          stream);
 
         // Upload this token's id and position (device-to-device for id)
-        int pos = start_position + t;
-        cudaMemcpyAsync(d_mutable_position, &pos, sizeof(int),
+        cudaMemcpyAsync(d_mutable_position, h_pinned_positions + t, sizeof(int),
                         cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_mutable_token_id, d_prefill_token_ids + t, sizeof(int),
                         cudaMemcpyDeviceToDevice, stream);
@@ -1291,7 +1342,9 @@ extern "C" void launch_ldg_prefill(
             (float*)g_activations, (float*)g_residual,
             (half*)g_q, (half*)g_k, (half*)g_v,
             (half*)g_attn_out, (float*)g_mlp_intermediate, (float*)g_normalized,
+            d_norm_scratch,
             d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag,
+            d_eos_flag,
             num_layers, d_mutable_position, d_mutable_token_id,
             max_seq_len, attn_scale);
     }
@@ -1324,11 +1377,10 @@ extern "C" void launch_ldg_generate_nosync(
         cudaMalloc(&d_step_counter, sizeof(int));
         cudaMalloc(&d_output_token, sizeof(int));
     }
-    // Reset all per-generation state (stream-ordered)
-    cudaMemsetAsync(d_step_counter,    0, sizeof(int),          stream);
-    cudaMemsetAsync(d_output_token,    0, sizeof(int),          stream);
+    cudaMemsetAsync(d_step_counter, 0, sizeof(int), stream);
+    cudaMemsetAsync(d_output_token, 0, sizeof(int), stream);
+    cudaMemsetAsync(d_eos_flag,     0, sizeof(int), stream);
 
-    // Upload starting position and first token
     *h_pinned_position = start_position;
     *h_pinned_token_id = first_token_id;
     cudaMemcpyAsync(d_mutable_position, h_pinned_position, sizeof(int),
@@ -1336,21 +1388,13 @@ extern "C" void launch_ldg_generate_nosync(
     cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
                     cudaMemcpyHostToDevice, stream);
 
-    // All kernel launches go into the same stream — CUDA guarantees ordering.
-    // EOS early-stop: after each step, check d_eos_flag with a CPU-side peek.
-    // Then peek uses cudaMemcpyAsync into a pinned host int, then a lightweight
-    // cudaStreamSynchronize only when EOS is detected — typically after ~8 steps. Hence, all instructions are launcehed synchronously.
-    // This will be seen in the nsight system
-    static int  *d_eos_flag    = nullptr;
-    static int  *h_eos_flag    = nullptr;   // pinned host mirror
-    if (!d_eos_flag) {
-        cudaMalloc(&d_eos_flag, sizeof(int));
-        cudaHostAlloc(&h_eos_flag, sizeof(int), cudaHostAllocDefault);
-    }
-
-    int eos_token_id = eos_token_id_arg;
-    cudaMemsetAsync(d_eos_flag, 0, sizeof(int), stream);
-
+    // All num_steps launches queued upfront — NO per-step sync.
+    //
+    // When ldg_update_step sets d_eos_flag = 1, subsequent
+    // ldg_decode_kernel_persistent launches see the flag (stream-ordered)
+    // and return immediately from ldg_decode_body — near-zero cost no-ops.
+    // ldg_update_step also guards against writing garbage tokens after EOS.
+    // The GPU pipeline stays full for the entire generation.
     for (int step = 0; step < num_steps; step++) {
         cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
         cudaMemsetAsync(d_barrier_sense,   0, sizeof(unsigned int), stream);
@@ -1364,7 +1408,9 @@ extern "C" void launch_ldg_generate_nosync(
             (float*)g_activations, (float*)g_residual,
             (half*)g_q, (half*)g_k, (half*)g_v,
             (half*)g_attn_out, (float*)g_mlp_intermediate, (float*)g_normalized,
+            d_norm_scratch,
             d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag,
+            d_eos_flag,
             num_layers, d_mutable_position, d_mutable_token_id,
             max_seq_len, attn_scale);
 
@@ -1379,19 +1425,13 @@ extern "C" void launch_ldg_generate_nosync(
         ldg_update_step<<<1, 1, 0, stream>>>(
             d_output_token, d_mutable_token_id,
             d_mutable_position, output_log,
-            d_step_counter, d_eos_flag, eos_token_id);
+            d_step_counter, d_eos_flag, eos_token_id_arg);
 
-        // Copy eos flag to pinned host memory — async, no stall yet
-        cudaMemcpyAsync(h_eos_flag, d_eos_flag, sizeof(int),
-                        cudaMemcpyDeviceToHost, stream);
-        // Sync only to read the flag — this is one sync per step but only
-        // when we're near EOS; for steps 0..5 the flag will be 0 most of the time.
-        // On EOS step we break immediately, saving (num_steps - step - 1) kernels.
-        cudaStreamSynchronize(stream);
-        if (*h_eos_flag) break;
+        // No sync here. No EOS memcpy here.
+        // ldg_decode_body reads d_eos_flag on the GPU for early exit.
     }
 
-    // Final sync (no-op if loop already synced on last iteration)
+    // Single sync — entire generation complete
     cudaStreamSynchronize(stream);
 }
 
@@ -1401,22 +1441,15 @@ static inline void ldg_configure_kernel_attributes() {
     if (configured) return;
     configured = true;
 
+    // FIX 9: MaxL1 for decode — weight streaming benefits from large L1
     cudaFuncSetAttribute(ldg_decode_kernel_persistent,
                          cudaFuncAttributePreferredSharedMemoryCarveout,
-                         cudaSharedmemCarveoutMaxShared);
-    cudaFuncSetAttribute(ldg_decode_kernel_persistent,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         100 * 1024);   // 100 KB — full sm_120 shared mem bank
-
+                         cudaSharedmemCarveoutMaxL1);
     cudaFuncSetAttribute(ldg_decode_kernel_direct,
                          cudaFuncAttributePreferredSharedMemoryCarveout,
-                         cudaSharedmemCarveoutMaxShared);
-    cudaFuncSetAttribute(ldg_decode_kernel_direct,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         100 * 1024);   // 100 KB
+                         cudaSharedmemCarveoutMaxL1);
 
-    // LM head kernels: maximise L1/texture cache instead.
-    // The LM head is bandwidth-bound on weight reads — L1 helps more than smem.
+    // LM head: already MaxL1 — unchanged
     cudaFuncSetAttribute(ldg_lm_head_phase1,
                          cudaFuncAttributePreferredSharedMemoryCarveout,
                          cudaSharedmemCarveoutMaxL1);

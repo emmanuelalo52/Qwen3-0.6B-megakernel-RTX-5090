@@ -17,3 +17,7 @@
 /vllm_server_profile_100.nsys-rep
 /vllm_single_v3.nsys-repModel/*.safetensors
 Model/*.bin
+/home/emmanuelalo52/Qwen06B_comp/ 
+vllm_single_v3.nsys-rep
+ 
+ 

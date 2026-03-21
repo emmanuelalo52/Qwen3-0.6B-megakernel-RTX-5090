@@ -182,7 +182,7 @@ def _pack_layer_weights(layer_weights: list) -> torch.Tensor:
 
 
 class Decoder:
-    """Stateful decoder wrapping the Qwen megakernel ops."""
+    # Stateful decoder wrapping the Qwen megakernel ops
 
     def __init__(
         self,
@@ -207,8 +207,7 @@ class Decoder:
         self._check_weight_alignment(weights["layer_weights"])
         self._attn_scale = 1.0 / math.sqrt(HEAD_DIM)
 
-        # KV cache — OPT 3: allocate once, reset with a tracked high-water mark
-        # instead of zeroing the full 235MB buffer every request.
+        # KV cache — OPT 3: allocate once, reset with a tracked high-water mark instead of zeroing the full 235MB buffer every request.
         self._k_cache = torch.zeros(
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
             dtype=torch.float16, device="cuda",
@@ -233,18 +232,10 @@ class Decoder:
         self._fmax_idxs = torch.empty(4096,               **i32)
         self._out_token = torch.empty(1,                  **i32)
 
-        # BUG-4 FIX: Output log for batched generation (max 2048 tokens).
-        # The comment previously said "pinned" but used device="cuda" — not pinned.
-        # Now correctly allocated as pinned (page-locked) CPU memory for a fast
-        # DtoH transfer, with a .cuda() view held for passing to the kernel.
-        # Pinned memory: ~10µs DtoH for 2048 int32 vs ~50µs unpinned.
         self._output_log_cpu = torch.empty(MAX_SEQ_LEN, dtype=torch.int32).pin_memory()
         self._output_log     = self._output_log_cpu.cuda()   # CUDA view passed to kernel
 
-        # OPT 2: cache op lookups (avoid repeated getattr every call)
         self._gen = _require_megakernel_op("generate_nosync")
-        # Batched prefill op — fills KV cache for all prompt tokens in one C call.
-        # Falls back to generate_nosync loop if not available (older build).
         try:
             self._prefill_op = _require_megakernel_op("prefill")
         except RuntimeError:
@@ -253,7 +244,7 @@ class Decoder:
     def _prefill_args(self, token_ids_tensor):
         """Pack arguments for the batched prefill op."""
         return (
-            token_ids_tensor,           # CPU int32 tensor [num_tokens]
+            token_ids_tensor,        
             self._embed_weight,
             self._layer_weights_packed,
             self._final_norm_weight,
@@ -280,17 +271,7 @@ class Decoder:
         )
 
     def _gen_args(self, first_token, num_steps, position, output_log=None):
-        """Pack arguments for generate_nosync — avoids repeating the list inline.
-
-        Argument order matches the C++ pybind11 generate_nosync() signature exactly:
-            first_token_id, num_steps,
-            embed_weight, layer_weights_packed, final_norm_weight, lm_head_weight,
-            cos_table, sin_table, k_cache, v_cache,
-            hidden, act, res, q, k, v, attn_out, mlp_inter, norm_out,
-            bmax_vals, bmax_idxs,
-            output_log,
-            num_layers, position, max_seq_len, attn_scale, eos_token_id
-        """
+        # Pack arguments for generate_nosync — avoids repeating the list inline.
         if output_log is None:
             output_log = self._output_log  # prefill: log is ignored (not read)
         return (
@@ -374,18 +355,6 @@ class Decoder:
         return int(result_tensor.item())
 
     def reset(self):
-        """
-        OPT 3: Partial KV cache reset.
-
-        Only zero the positions that were actually written last request
-        instead of zeroing the entire 235MB cache every time.
-        For short prompts (avg 16 in + 32 out = 48 positions) this is
-        ~42x less data to zero vs flushing all 2048 positions.
-
-        BUG-3 FIX: Removed the unused next_seq_len parameter that was accepted
-        but silently ignored, making the call-sites misleading. The high-water
-        mark already tracks exactly what needs to be zeroed.
-        """
         self._position = 0
         if self._kv_high_water > 0:
             hw = self._kv_high_water
@@ -399,19 +368,14 @@ class Decoder:
         return self._position
 
     def generate(self, prompt: str, max_tokens: int = 100) -> str:
-        # OPT 1: Encode once, reuse for token counting.
         ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         n_prompt = len(ids)
 
-        # BUG-3 FIX: reset() no longer takes next_seq_len (was dead code).
         self.reset()
 
         prefill_ids = ids[:-1]
 
-        # PREFILL OPT: Use batched prefill if available.
-        # launch_ldg_prefill processes all prompt tokens in one C call with one sync,
-        # vs the old approach of calling generate_nosync N times from Python.
-        # For avg 16-token prompt: saves ~15 kernel-launch roundtrips.
+        # launch_ldg_prefill processes all prompt tokens in one C call with one sync
         if prefill_ids:
             if self._prefill_op is not None:
                 # Pack token ids as CPU int32 tensor and call the batched op
@@ -421,32 +385,19 @@ class Decoder:
                 # Fallback: original generate_nosync loop
                 self._gen(*self._gen_args(prefill_ids[0], len(prefill_ids), self._position))
             self._position += len(prefill_ids)
-
-        # BN-1 FIX (Python side — CRITICAL):
-        # The old code called step() in a Python for-loop which does
-        # torch.cuda.synchronize() on EVERY token — that's max_tokens × sync overhead.
-        #
-        # New approach: allocate a device output log, call generate_nosync for
-        # ALL max_tokens steps in one shot (the C++ side now has NO mid-loop sync),
-        # then do a SINGLE sync + copy at the end to find where EOS occurred.
-        # This collapses N synchronizations into 1.
+        # Allocate a device output log, call generate_nosync for all max_tokens steps in one shot (the C++ side now has NO mid-loop sync), then do a SINGLE sync + copy at the end to find where EOS occurred.
 
         eos = self.tokenizer.eos_token_id
         cur_token = ids[-1]
 
-        # Output log buffer: stores each generated token ID on-device.
-        # BUG-4 FIX: self._output_log is now backed by pinned memory
-        # (self._output_log_cpu) for fast DtoH transfer (~10µs for 128 ints).
         output_log = self._output_log[:max_tokens]
         output_log.fill_(-1)  # sentinel
 
         # Run all steps on-device — no per-step CPU sync
         self._gen(*self._gen_args(cur_token, max_tokens, self._position, output_log))
 
-        # BUG-4 FIX: Single DtoH transfer to pinned CPU buffer — fast path.
-        # .cpu() on a pinned-backed CUDA tensor uses the DMA engine directly.
         tokens_cpu = output_log.cpu().tolist()
-        self._position += max_tokens  # upper bound; exact position not needed after gen
+        self._position += max_tokens
 
         # Trim at EOS
         out = []

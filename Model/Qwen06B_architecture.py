@@ -11,15 +11,19 @@ except ImportError:
 
 EXTENSION_ABI_VERSION = 2
 
-NUM_LAYERS = 28
-NUM_KV_HEADS = 8
-HEAD_DIM = 128
-HIDDEN_SIZE = 1024
+NUM_LAYERS      = 28
+NUM_KV_HEADS    = 8
+HEAD_DIM        = 128
+HIDDEN_SIZE     = 1024
 INTERMEDIATE_SIZE = 3072
-Q_SIZE = 16 * HEAD_DIM   # 2048
-KV_SIZE = 8 * HEAD_DIM   # 1024
-MAX_SEQ_LEN = 2048
-VOCAB_SIZE = 151936
+Q_SIZE          = 16 * HEAD_DIM   # 2048
+KV_SIZE         = 8  * HEAD_DIM   # 1024
+MAX_SEQ_LEN     = 2048
+VOCAB_SIZE      = 151936
+
+# FIX A: match the compile-time constant in megakernel_5090.cu so buffer
+#         sizes are derived from a single source of truth.
+LDG_LM_NUM_BLOCKS = 680
 
 ROPE_THETA = 1_000_000.0
 
@@ -36,12 +40,12 @@ def _require_megakernel_op(op_name: str):
     available_ops = []
     if qwen_megakernel_C is not None:
         available_ops.extend(
-            op for op in ("decode", "generate_nosync")
+            op for op in ("decode", "generate_nosync", "prefill")
             if hasattr(qwen_megakernel_C, op)
         )
     if namespace is not None:
         available_ops.extend(
-            op for op in ("decode", "generate_nosync")
+            op for op in ("decode", "generate_nosync", "prefill")
             if hasattr(namespace, op)
         )
 
@@ -92,7 +96,6 @@ _decode = _require_megakernel_op("decode")
 def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
     """Load Qwen3-0.6B weights from HuggingFace into GPU tensors."""
     if not verbose:
-        import os
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
@@ -124,7 +127,7 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
         ROPE_THETA ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
     )
     positions = torch.arange(MAX_SEQ_LEN, dtype=torch.float32)
-    freqs = torch.outer(positions, inv_freq)
+    freqs     = torch.outer(positions, inv_freq)
     cos_table = torch.cos(freqs).repeat(1, 2).to(torch.float16).cuda().contiguous()
     sin_table = torch.sin(freqs).repeat(1, 2).to(torch.float16).cuda().contiguous()
 
@@ -150,7 +153,7 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
         embed_weight=embed_weight,
         layer_weights=layer_weights,
         final_norm_weight=state["model.norm.weight"].contiguous(),
-        lm_head_weight=embed_weight,  # tied embeddings
+        lm_head_weight=embed_weight,   # tied embeddings
         cos_table=cos_table,
         sin_table=sin_table,
     )
@@ -161,28 +164,29 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
 
 
 def _pack_layer_weights(layer_weights: list) -> torch.Tensor:
-    N = 11
+    N        = 11
     n_layers = len(layer_weights) // N
     assert len(layer_weights) == n_layers * N
+
     all_ptrs = []
     for li in range(n_layers):
         base = li * N
         for j in range(N):
             all_ptrs.append(layer_weights[base + j].data_ptr())
-        all_ptrs.append(0)  # padding to 12 pointers per layer
+        all_ptrs.append(0)   # padding → 12 pointers × 8 bytes = 96 bytes, 16-byte aligned
 
     t = torch.zeros(len(all_ptrs) + 2, dtype=torch.int64, device="cuda")
-    base_ptr = t.data_ptr()
-    offset = (16 - (base_ptr % 16)) % 16
+    base_ptr     = t.data_ptr()
+    offset       = (16 - (base_ptr % 16)) % 16
     offset_elems = offset // 8
-    t_aligned = t[offset_elems : offset_elems + len(all_ptrs)]
+    t_aligned    = t[offset_elems : offset_elems + len(all_ptrs)]
     t_aligned.copy_(torch.tensor(all_ptrs, dtype=torch.int64))
     assert t_aligned.data_ptr() % 16 == 0, "Alignment failed!"
     return t_aligned
 
 
 class Decoder:
-    # Stateful decoder wrapping the Qwen megakernel ops
+    """Stateful decoder wrapping the Qwen megakernel ops."""
 
     def __init__(
         self,
@@ -194,46 +198,61 @@ class Decoder:
         if weights is None:
             weights, tokenizer = load_weights(model_name, verbose=verbose)
 
-        self.tokenizer = tokenizer
-        self._position = 0
-        self._weights = weights
+        self.tokenizer              = tokenizer
+        self._position              = 0
+        self._weights               = weights
 
-        self._embed_weight        = weights["embed_weight"]
-        self._final_norm_weight   = weights["final_norm_weight"]
-        self._lm_head_weight      = weights["lm_head_weight"]
-        self._cos_table           = weights["cos_table"]
-        self._sin_table           = weights["sin_table"]
-        self._layer_weights_packed = _pack_layer_weights(weights["layer_weights"])
+        self._embed_weight          = weights["embed_weight"]
+        self._final_norm_weight     = weights["final_norm_weight"]
+        self._lm_head_weight        = weights["lm_head_weight"]
+        self._cos_table             = weights["cos_table"]
+        self._sin_table             = weights["sin_table"]
+        self._layer_weights_packed  = _pack_layer_weights(weights["layer_weights"])
         self._check_weight_alignment(weights["layer_weights"])
         self._attn_scale = 1.0 / math.sqrt(HEAD_DIM)
 
-        # KV cache — OPT 3: allocate once, reset with a tracked high-water mark instead of zeroing the full 235MB buffer every request.
-        self._k_cache = torch.zeros(
+        # KV cache — allocate once; partial reset via high-water mark avoids
+        # zeroing the full 235 MB buffer every request.
+        self._k_cache       = torch.zeros(
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
             dtype=torch.float16, device="cuda",
         )
-        self._v_cache = torch.zeros_like(self._k_cache)
-        self._kv_high_water = 0  # how many positions were written last request
+        self._v_cache       = torch.zeros_like(self._k_cache)
+        self._kv_high_water = 0
 
-        # Scratch buffers
+        # Scratch buffers — sizes derived from model constants above.
         f16 = dict(dtype=torch.float16, device="cuda")
         f32 = dict(dtype=torch.float32, device="cuda")
         i32 = dict(dtype=torch.int32,   device="cuda")
+
         self._hidden    = torch.empty(HIDDEN_SIZE,        **f16)
-        self._act       = torch.empty(Q_SIZE,             **f32)
+
+        # g_activations is indexed up to HIDDEN_SIZE=1024, not Q_SIZE=2048. Previous allocation (Q_SIZE) was a 2× overallocation.
+        self._act       = torch.empty(HIDDEN_SIZE,        **f32)
+
+        # g_residual is accepted by the kernel for ABI compatibility but is no
+        # longer read or written — the fixed kernel reads the half* residual
+        # directly from hidden_buffer.  Kept here so qwen_ops.cpp compiles
+        # without changes.
         self._res       = torch.empty(HIDDEN_SIZE,        **f32)
+
         self._q         = torch.empty(Q_SIZE,             **f16)
         self._k         = torch.empty(KV_SIZE,            **f16)
         self._v         = torch.empty(KV_SIZE,            **f16)
         self._attn_out  = torch.empty(Q_SIZE,             **f16)
         self._mlp_inter = torch.empty(INTERMEDIATE_SIZE,  **f32)
         self._norm_out  = torch.empty(HIDDEN_SIZE,        **f32)
-        self._fmax_vals = torch.empty(4096,               **f32)
-        self._fmax_idxs = torch.empty(4096,               **i32)
+
+        # size LM-head reduction buffers from the compile-time constant, not a magic number.  LDG_LM_NUM_BLOCKS=680 in megakernel_5090.cu; 4096 was a 6× overallocation.
+        self._fmax_vals = torch.empty(LDG_LM_NUM_BLOCKS,  **f32)
+        self._fmax_idxs = torch.empty(LDG_LM_NUM_BLOCKS,  **i32)
+
         self._out_token = torch.empty(1,                  **i32)
 
+        # Pinned output log: kernel writes token IDs on-device; single DtoH
+        # copy at the end of generation.
         self._output_log_cpu = torch.empty(MAX_SEQ_LEN, dtype=torch.int32).pin_memory()
-        self._output_log     = self._output_log_cpu.cuda()   # CUDA view passed to kernel
+        self._output_log     = self._output_log_cpu.cuda()
 
         self._gen = _require_megakernel_op("generate_nosync")
         try:
@@ -241,10 +260,12 @@ class Decoder:
         except RuntimeError:
             self._prefill_op = None
 
+    # Argument packers
+
     def _prefill_args(self, token_ids_tensor):
         """Pack arguments for the batched prefill op."""
         return (
-            token_ids_tensor,        
+            token_ids_tensor,
             self._embed_weight,
             self._layer_weights_packed,
             self._final_norm_weight,
@@ -265,15 +286,15 @@ class Decoder:
             self._fmax_vals,
             self._fmax_idxs,
             NUM_LAYERS,
-            self._position,     # start_position
+            self._position,   # start_position
             MAX_SEQ_LEN,
             self._attn_scale,
         )
 
     def _gen_args(self, first_token, num_steps, position, output_log=None):
-        # Pack arguments for generate_nosync — avoids repeating the list inline.
+        """Pack arguments for generate_nosync."""
         if output_log is None:
-            output_log = self._output_log  # prefill: log is ignored (not read)
+            output_log = self._output_log
         return (
             first_token, num_steps,
             self._embed_weight,
@@ -300,15 +321,17 @@ class Decoder:
             position,
             MAX_SEQ_LEN,
             self._attn_scale,
-            self.tokenizer.eos_token_id,  # EOS early-stop in generate_nosync
+            self.tokenizer.eos_token_id,
         )
 
+    # Weight alignment check
+
     def _check_weight_alignment(self, layer_weights_list):
-        N = 11
+        N     = 11
         names = [
             "input_layernorm", "q_proj", "k_proj", "v_proj",
             "q_norm", "k_norm", "o_proj", "post_attn_norm",
-            "gate_proj", "up_proj", "down_proj"
+            "gate_proj", "up_proj", "down_proj",
         ]
         bad = []
         for li in range(NUM_LAYERS):
@@ -323,7 +346,9 @@ class Decoder:
         else:
             print("All weight pointers 16-byte aligned OK")
 
-    def step(self, input_token_id: int | torch.Tensor) -> int:
+    # Single-step decode (used for testing / interactive use)
+
+    def step(self, input_token_id: int) -> int:
         result_tensor = _decode(
             input_token_id,
             self._embed_weight,
@@ -354,11 +379,12 @@ class Decoder:
         self._position += 1
         return int(result_tensor.item())
 
+    # KV cache reset
+
     def reset(self):
         self._position = 0
         if self._kv_high_water > 0:
             hw = self._kv_high_water
-            # Zero only [0 : high_water] positions across all layers and heads
             self._k_cache[:, :, :hw, :].zero_()
             self._v_cache[:, :, :hw, :].zero_()
         self._kv_high_water = 0
@@ -367,46 +393,55 @@ class Decoder:
     def position(self) -> int:
         return self._position
 
-    def generate(self, prompt: str, max_tokens: int = 100) -> str:
-        ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+    # Full generation 
+
+    def generate(self, prompt: str, max_tokens: int = 100) -> tuple:
+        ids      = self.tokenizer.encode(prompt, add_special_tokens=False)
         n_prompt = len(ids)
 
         self.reset()
 
         prefill_ids = ids[:-1]
 
-        # launch_ldg_prefill processes all prompt tokens in one C call with one sync
+        # Prefill: build KV cache for all prompt tokens except the last.
+        # launch_ldg_prefill processes all tokens in one C call with one sync.
         if prefill_ids:
             if self._prefill_op is not None:
-                # Pack token ids as CPU int32 tensor and call the batched op
                 ids_tensor = torch.tensor(prefill_ids, dtype=torch.int32)
                 self._prefill_op(*self._prefill_args(ids_tensor))
             else:
-                # Fallback: original generate_nosync loop
-                self._gen(*self._gen_args(prefill_ids[0], len(prefill_ids), self._position))
+                # Fallback: use generate_nosync (correct with fixed kernel)
+                self._gen(*self._gen_args(
+                    prefill_ids[0], len(prefill_ids), self._position
+                ))
             self._position += len(prefill_ids)
-        # Allocate a device output log, call generate_nosync for all max_tokens steps in one shot (the C++ side now has NO mid-loop sync), then do a SINGLE sync + copy at the end to find where EOS occurred.
 
-        eos = self.tokenizer.eos_token_id
-        cur_token = ids[-1]
-
+        # Decode: queue all max_tokens steps on-device with NO per-step CPU sync.
+        # The fixed kernel's ldg_decode_body checks d_eos_flag at entry and
+        # returns immediately after EOS — subsequent steps are near-zero cost.
+        # ldg_update_step also guards against writing garbage tokens after EOS.
+        # One cudaStreamSynchronize fires at the end of launch_ldg_generate_nosync.
+        cur_token  = ids[-1]
         output_log = self._output_log[:max_tokens]
-        output_log.fill_(-1)  # sentinel
+        output_log.fill_(-1)   # sentinel: positions not written remain -1
 
-        # Run all steps on-device — no per-step CPU sync
         self._gen(*self._gen_args(cur_token, max_tokens, self._position, output_log))
 
+        # Single DtoH copy — stream is already idle after generate_nosync's
+        # internal cudaStreamSynchronize.
         tokens_cpu = output_log.cpu().tolist()
-        self._position += max_tokens
 
-        # Trim at EOS
+        # Trim at EOS or sentinel
         out = []
         for tok in tokens_cpu:
-            if tok == -1 or tok == eos:
+            if tok == -1 or tok == self.tokenizer.eos_token_id:
                 break
             out.append(tok)
 
-        # Track KV high-water for partial reset
+        # FIX B: advance position by the number of tokens actually generated,not max_tokens. It matters for stateful multi-turn use where reset() is not called between turns.
+        self._position += len(out)
+
+        # Track KV high-water mark for partial reset on next request.
         self._kv_high_water = n_prompt + len(out)
 
         text = self.tokenizer.decode(out, skip_special_tokens=True)

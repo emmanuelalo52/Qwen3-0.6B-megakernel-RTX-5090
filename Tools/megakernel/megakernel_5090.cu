@@ -80,7 +80,7 @@ constexpr int KV_SIZE         = NUM_KV_HEADS * HEAD_DIM;  // 1024
 #define LDG_PREFETCH_UP 1
 #endif
 
-constexpr int   LDG_NUM_WARPS = LDG_LM_BLOCK_SIZE / WARP_SIZE;
+constexpr int   LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS   = 1e-6f;
 constexpr int   LDG_VOCAB_SIZE = 151936;
 

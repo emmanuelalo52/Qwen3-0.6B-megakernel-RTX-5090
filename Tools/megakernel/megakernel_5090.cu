@@ -1441,7 +1441,7 @@ static inline void ldg_configure_kernel_attributes() {
     if (configured) return;
     configured = true;
 
-    // FIX 9: MaxL1 for decode — weight streaming benefits from large L1
+    // MaxL1 for decode — weight streaming benefits from large L1
     cudaFuncSetAttribute(ldg_decode_kernel_persistent,
                          cudaFuncAttributePreferredSharedMemoryCarveout,
                          cudaSharedmemCarveoutMaxL1);

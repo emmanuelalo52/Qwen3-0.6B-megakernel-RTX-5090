@@ -1,4 +1,4 @@
-# Qwen3-0.6B Megakernel — Reproduction Guide
+# Qwen3-0.6B Megakernel - Reproduction Guide
 
 Custom CUDA megakernel for Qwen3-0.6B inference on RTX 5090, benchmarked against vLLM's standard PagedAttention baseline.
 
@@ -22,7 +22,7 @@ Custom CUDA megakernel for Qwen3-0.6B inference on RTX 5090, benchmarked against
 - Python 3.12
 - Ubuntu 24 (tested on Vast.ai container)
 
-**Note:** The CUDA megakernel compiles for sm_120 (Blackwell architecture) and requires a physical RTX 5090. It cannot run on older GPUs or on macOS. Mac users must use a remote GPU instance — see the macOS section below.
+**Note:** The CUDA megakernel compiles for sm_120 (Blackwell architecture) and requires a physical RTX 5090. It cannot run on older GPUs or on macOS. Mac users must use a remote GPU instance - see the macOS section below.
 
 ---
 
@@ -491,22 +491,22 @@ All platforms ultimately run the same server on Linux. The difference is only in
 - WSL2 with Ubuntu (run `wsl --install` in PowerShell if not already set up)
 - NVIDIA Nsight Systems 2025.3.2 for viewing profiles (Windows native)
 
-**Step 1 — Generate SSH key in WSL:**
+**Step 1 - Generate SSH key in WSL:**
 ```bash
 ssh-keygen -t ed25519 -C "your_email@example.com"
 cat ~/.ssh/id_ed25519.pub
 ```
 Paste the public key into your Vast.ai instance under Manage SSH Keys.
 
-**Step 2 — Connect VS Code to the remote server:**
+**Step 2 - Connect VS Code to the remote server:**
 
 1. Open VS Code and press Ctrl+Shift+P
 2. Type Remote-SSH: Connect to Host, then Add New SSH Host
 3. Enter: `ssh -p <PORT> root@<IP>`
 4. Select `C:\Users\YourName\.ssh\config` to save
-5. Click Connect — VS Code opens a new window on the server
+5. Click Connect - VS Code opens a new window on the server
 
-**Step 3 — Copy files from WSL to server:**
+**Step 3 - Copy files from WSL to server:**
 ```bash
 export SERVER_IP=<your_instance_ip>
 export SERVER_PORT=<your_instance_port>
@@ -524,7 +524,7 @@ scp -i ~/.ssh/id_ed25519 -P $SERVER_PORT \
   root@$SERVER_IP:~/qwen_megakernel/Model/
 ```
 
-**Step 4 — SSH tunnel for accessing the server locally:**
+**Step 4 - SSH tunnel for accessing the server locally:**
 ```bash
 ssh -i ~/.ssh/id_ed25519 -p $SERVER_PORT root@$SERVER_IP \
     -L 8000:localhost:8000 -N -o ServerAliveInterval=30 &
@@ -556,14 +556,14 @@ Open in Nsight Systems on Windows via File > Open and navigate to:
 
 macOS has no CUDA support. All GPU work runs on the remote Linux server. Your Mac is purely the client and editor.
 
-**Step 1 — Generate SSH key:**
+**Step 1 - Generate SSH key:**
 ```bash
 ssh-keygen -t ed25519 -C "your_email@example.com"
 cat ~/.ssh/id_ed25519.pub
 ```
 Paste the public key into Vast.ai under Manage SSH Keys.
 
-**Step 2 — Connect VS Code:**
+**Step 2 - Connect VS Code:**
 
 1. Install the Remote - SSH extension in VS Code
 2. Press Cmd+Shift+P and type Remote-SSH: Connect to Host
@@ -571,7 +571,7 @@ Paste the public key into Vast.ai under Manage SSH Keys.
 4. Select `~/.ssh/config` to save
 5. Click Connect
 
-**Step 3 — Copy files from Mac to server:**
+**Step 3 - Copy files from Mac to server:**
 ```bash
 export SERVER_IP=<your_instance_ip>
 export SERVER_PORT=<your_instance_port>
@@ -589,7 +589,7 @@ scp -i ~/.ssh/id_ed25519 -P $SERVER_PORT \
   root@$SERVER_IP:~/qwen_megakernel/Model/
 ```
 
-**Step 4 — SSH tunnel:**
+**Step 4 - SSH tunnel:**
 ```bash
 ssh -i ~/.ssh/id_ed25519 -p $SERVER_PORT root@$SERVER_IP \
     -L 8000:localhost:8000 -N -o ServerAliveInterval=30 &
@@ -605,7 +605,7 @@ Nsight Systems does not have a macOS GUI. Options:
 
 ---
 
-### Local RTX 5090 — Windows + WSL2
+### Local RTX 5090 - Windows + WSL2
 
 If you have a physical RTX 5090 in your Windows machine, you can run everything locally via WSL2 with CUDA passthrough. No remote server needed.
 
@@ -614,7 +614,7 @@ If you have a physical RTX 5090 in your Windows machine, you can run everything 
 - NVIDIA Driver 580+ installed on Windows (WSL2 inherits this automatically)
 - Ubuntu 24.04 in WSL2
 
-**Step 1 — Verify CUDA is accessible in WSL2:**
+**Step 1 - Verify CUDA is accessible in WSL2:**
 ```bash
 nvidia-smi        # should show RTX 5090 and CUDA 13.0
 nvcc --version    # should show CUDA 13.0
@@ -622,7 +622,7 @@ nvcc --version    # should show CUDA 13.0
 
 If nvcc is not found, install the CUDA toolkit from developer.nvidia.com/cuda-downloads and select WSL-Ubuntu as the target.
 
-**Step 2 — Copy files into WSL:**
+**Step 2 - Copy files into WSL:**
 ```bash
 mkdir -p ~/qwen_megakernel/Model
 
@@ -632,13 +632,13 @@ cp /mnt/c/Users/YourName/qwen_project/Model/Qwen06B_architecture.py ~/qwen_megak
 # repeat for all files listed in Repository Structure above
 ```
 
-**Step 3 — Install dependencies:**
+**Step 3 - Install dependencies:**
 ```bash
 pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 pip install transformers fastapi "uvicorn[standard]" orjson pydantic openai ninja accelerate vllm
 ```
 
-**Step 4 — Build the CUDA extension:**
+**Step 4 - Build the CUDA extension:**
 ```bash
 cd ~/qwen_megakernel
 
@@ -648,7 +648,7 @@ CUDA_HOME=$CUDA_PATH TORCH_CUDA_ARCH_LIST="12.0a" python setup.py build_ext --in
 
 On local WSL2, the CUDA version mismatch patch is usually not needed. If you see CUDA_MISMATCH_MESSAGE, apply the same sed patch from the cloud setup section below.
 
-**Step 5 — Full ncu profiling is available on local GPU:**
+**Step 5 - Full ncu profiling is available on local GPU:**
 
 Unlike cloud containers, a local GPU gives full hardware counter access:
 ```bash
@@ -670,26 +670,26 @@ Everything from the cloud setup Steps 4 onward applies identically. The server r
 
 ---
 
-### Local RTX 5090 — Native Linux
+### Local RTX 5090 - Native Linux
 
 **Prerequisites:**
 - Ubuntu 22.04 or 24.04
 - NVIDIA Driver 580+: `sudo apt install nvidia-driver-580`
 - CUDA 13.0 toolkit
 
-**Step 1 — Verify:**
+**Step 1 - Verify:**
 ```bash
 nvidia-smi        # should show RTX 5090
 nvcc --version    # should show CUDA 13.0
 ```
 
-**Step 2 — Install dependencies:**
+**Step 2 - Install dependencies:**
 ```bash
 pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 pip install transformers fastapi "uvicorn[standard]" orjson pydantic openai ninja accelerate vllm
 ```
 
-**Step 3 — Build:**
+**Step 3 - Build:**
 ```bash
 cd ~/qwen_megakernel
 
@@ -711,23 +711,23 @@ d.generate('What is the capital of France?', max_tokens=32)
 
 ---
 
-## Cloud Setup (Vast.ai) — Full Steps
+## Cloud Setup (Vast.ai) - Full Steps
 
-### Step 1 — Provision Instance
+### Step 1 - Provision Instance
 
 Rent an RTX 5090 on Vast.ai (https://cloud.vast.ai):
 - GPU: RTX 5090
 - Image: pytorch/pytorch:latest or any Ubuntu 24 image
 - Disk: 30GB minimum
 
-### Step 2 — Install Dependencies
+### Step 2 - Install Dependencies
 
 ```bash
 pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 pip install transformers fastapi "uvicorn[standard]" orjson pydantic openai ninja accelerate vllm
 ```
 
-### Step 3 — Build the CUDA Extension
+### Step 3 - Build the CUDA Extension
 
 ```bash
 cd ~/qwen_megakernel
@@ -748,7 +748,7 @@ python -c "import qwen_megakernel_C; print('ABI version:', qwen_megakernel_C.abi
 # Expected: ABI version: 2
 ```
 
-### Step 4 — Create .env
+### Step 4 - Create .env
 
 ```bash
 cat > ~/qwen_megakernel/.env << 'EOF'
@@ -770,7 +770,7 @@ CONCURRENCY=1
 EOF
 ```
 
-### Step 5 — Run Megakernel Server
+### Step 5 - Run Megakernel Server
 
 ```bash
 cd ~/qwen_megakernel
@@ -791,7 +791,7 @@ curl http://localhost:8000/health
 # {"status":"ok"}
 ```
 
-### Step 6 — Run Megakernel Benchmark
+### Step 6 - Run Megakernel Benchmark
 
 In a second terminal on the server:
 ```bash
@@ -823,7 +823,7 @@ print(f'Tok/s:  {32/statistics.mean(latencies):.1f}')
 "
 ```
 
-### Step 7 — Run vLLM Baseline
+### Step 7 - Run vLLM Baseline
 
 ```bash
 pkill -f megakernel.py
@@ -836,12 +836,12 @@ Wait for `Application startup complete`, then in a second terminal:
 python client_benchmark.py
 ```
 
-### Step 8 — Profile with Nsight Systems
+### Step 8 - Profile with Nsight Systems
 
 ```bash
 export PATH=/opt/nvidia/nsight-compute/2025.3.1/host/target-linux-x64:$PATH
 
-# Megakernel — 100 prompts
+# Megakernel - 100 prompts
 nsys profile --output /tmp/megakernel_profile_100 \
     python -c "
 from prompt import PROMPTS
@@ -852,7 +852,7 @@ for p in PROMPTS:
     d.generate(p, max_tokens=32)
 "
 
-# vLLM — profile the server process directly
+# vLLM - profile the server process directly
 nsys profile \
     --output /tmp/vllm_server_profile \
     --trace cuda,cudnn,cublas,osrt \
@@ -894,17 +894,25 @@ Open in NVIDIA Nsight Systems 2025.3.2.
 
 ---
 
+## Key Design Decisions
+
+**Single kernel launch per inference phase** — `launch_ldg_generate_nosync` runs all 32 decode steps inside one launch using GPU-side grid barriers between layers. Traditional frameworks launch a separate kernel per operation per token.
+
+**Partial KV cache reset** — only zeros positions actually written (tracked via high-water mark) instead of clearing the full 235MB cache every request. For a 16-token prompt + 32-token output this is ~42x less data zeroed.
+
+**Single cudaStreamSynchronize per request** — all N token generation steps run on-device with no CPU sync until the final DtoH transfer of the output log.
+
+**Pinned memory output buffer** — the output token log is backed by pinned CPU memory for fast DMA transfer (~10us for 128 int32 tokens).
+
+---
+
 ## Troubleshooting
 
 | Error | Fix |
 |---|---|
 | `CUDA_MISMATCH_MESSAGE` during build | Apply the sed patch in the build step |
 | `ABI version mismatch` | Rebuild: `python setup.py build_ext --inplace --force` |
-| `qwen_megakernel_C op decode unavailable` | PyTorch was upgraded — rebuild the extension |
+| `qwen_megakernel_C op decode unavailable` | PyTorch was upgraded - rebuild the extension |
 | `Address already in use` on port 8000 | `pkill -f megakernel.py` or `pkill -f vllm` |
 | `ERR_NVGPUCTRPERM` for ncu | Container restriction — use nsys instead, or use a local or bare-metal GPU for full ncu access |
 | `nvidia-smi not found` in WSL2 | Install NVIDIA driver 580+ on the Windows host — WSL2 inherits it automatically |
-| `RTX 5090 Alignment Error` in Python | `_pack_layer_weights` alignment failed — ensure PyTorch allocates CUDA tensors at ≥16-byte boundaries (always true in practice; re-run if hit) |
-| `generate_nosync: output_log.numel() < num_steps` | Pre-allocate `output_log` with at least `max_tokens` elements before calling the op |
-| `All weight pointers 16-byte aligned OK` not printed | Extension loaded but weight check was skipped — confirm `_check_weight_alignment` runs in `Decoder.__init__` |
-| Tokens generated after EOS in output | Ensure `output_log` is initialised to `-1` sentinel before `generate_nosync` and that trimming stops at the first `-1` or EOS |

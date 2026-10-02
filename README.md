@@ -2,6 +2,8 @@
 
 Custom CUDA megakernel for Qwen3-0.6B inference on RTX 5090, benchmarked against vLLM's standard PagedAttention baseline.
 
+> **New: dynamic persistent megakernel for B200.** [`megakernel_dynamic/`](megakernel_dynamic/) rebuilds this kernel around CUTLASS's Blackwell dynamic persistent tile scheduler (cluster launch control). It has no grid barriers, runs a whole request in one launch, and supports fp16, fp8 (MXF8) and fp4 (NVF4) weights, in both CUDA and CuTeDSL. See [Dynamic Persistent Megakernel (B200)](#dynamic-persistent-megakernel-b200) below.
+
 ## Benchmark Results (RTX 5090, float16, 32 max tokens)
 
 | Metric | Megakernel | vLLM (enforce-eager) | Speedup |
@@ -40,8 +42,14 @@ qwen_megakernel/
 ├── rmsnorm.cuh / rmsnorm.cu    # RMSNorm CUDA kernel
 ├── swiglu.cuh / swiglu.cu      # SwiGLU CUDA kernel
 ├── swiglu_binding.cpp          # SwiGLU PyTorch binding
-└── Model/
-    └── Qwen06B_architecture.py # Weight loading + Decoder class
+├── Model/
+│   └── Qwen06B_architecture.py # Weight loading + Decoder class
+└── megakernel_dynamic/         # B200 rebuild: CLC dynamic persistent scheduler, fp16/fp8/fp4
+    ├── README.md               # Design notes, verification status, tuning knobs
+    ├── qwen_dps.py             # DpsDecoder: weight loading, MXF8/NVF4 quantization, generate()
+    ├── test_dps.py             # Token-level check against HF transformers + latency
+    ├── cuda/                   # CUDA C++ version (dps_scheduler.cuh, qwen_dps_megakernel.cu, setup.py)
+    └── cutedsl/                # CuTeDSL version (qwen_dps_cutedsl.py)
 ```
 
 ---
@@ -475,6 +483,69 @@ cudaFuncSetAttribute(ldg_decode_kernel_persistent,
 ```
 
 On Blackwell, the L1/shared memory is unified and configurable. Setting `MaxL1` allocates as much of the on-chip SRAM as possible to the L1 data cache rather than shared memory. The decode kernel uses shared memory for RMSNorm scratch and the attention accumulator (`s_out_acc[LDG_NUM_WARPS][HEAD_DIM]`), but the dominant access pattern is weight streaming — maximising L1 improves hit rates for the per-layer weight pointer table and the embedding lookup.
+
+---
+
+## Dynamic Persistent Megakernel (B200)
+
+[`megakernel_dynamic/`](megakernel_dynamic/) is a rebuild of this megakernel for **B200 (sm_100a)**. It is built around the scheduler in CUTLASS's `python/CuTeDSL/cutlass/utils/dynamic_persistent_tile_scheduler.py` (`ClcDynamicPersistentTileScheduler`) and exists in two versions: CUDA C++ (`cuda/`) and CuTeDSL (`cutedsl/`). Full design notes are in [`megakernel_dynamic/README.md`](megakernel_dynamic/README.md).
+
+### The idea
+
+Blackwell adds **cluster launch control (CLC)**. A kernel is launched with one CTA per unit of work, as if it were non-persistent. A running CTA can then call `clusterlaunchcontrol.try_cancel` to take over a CTA that has not started yet. CTAs stay resident and balance the load dynamically, with no fixed grid size.
+
+The megakernel uses this as follows:
+
+- Each token's work is cut into ~33k tiles: QKV, attention splits, O-proj, gate/up, down, and LM head.
+- A scheduler warp fetches the next tile with CLC.
+- A load warp streams that tile's weights into a shared-memory ring with TMA bulk copies.
+- Eight compute warps wait only on the global counter of the phase they read from.
+
+CLC hands out CTAs in no guaranteed order, but megakernel tiles depend on earlier tiles. So each granted CTA is used only as permission to run one tile, and an ordered ticket counter picks which tile. That keeps the kernel deadlock-free without needing every CTA resident at once.
+
+### Compared with `megakernel_5090.cu`
+
+| `megakernel_5090.cu` | `megakernel_dynamic/` |
+|---|---|
+| 170 CTAs, static row split per phase | ~33k tiles per token, assigned dynamically (CLC on B200, atomic tickets elsewhere) |
+| ~8 software grid barriers per layer; 154 CTAs idle during attention | no grid barriers; attention for a KV head starts as soon as its own QKV rows are done |
+| weights loaded after each barrier | next tiles' weights prefetched with TMA while waiting on dependencies |
+| 4 kernel launches per token | **1 launch per request**: prefill, all decode steps, LM-head argmax and token feedback on device |
+| fp16 weights | fp16, **fp8 (MXF8)** or **fp4 (NVF4)** weights |
+
+### Weight formats
+
+Weight-only, block-scaled formats as used by Blackwell's tensor cores and CUTLASS's `blockscaled_gemm` examples. Activations, norms and the KV cache stay fp16. Decode at batch 1 is limited by weight bandwidth, so fewer weight bytes per token translates directly into speed.
+
+| Format | Encoding | Weight bytes / token | Perplexity* | Next-token match vs fp16* |
+|---|---|---|---|---|
+| fp16 | fp16 | ~1.15 GB | 9.24 | — |
+| fp8 (MXF8) | e4m3 + e8m0 scale per 32 | ~0.60 GB | 9.32 | 94.3% |
+| fp4 (NVF4) | e2m1 + e4m3 scale per 16 + fp32 per tensor | ~0.33 GB | 10.70 | 84.1% |
+
+\*512 tokens, teacher-forced, round-to-nearest quantization. fp4 quality can be improved with a better quantizer (GPTQ/AWQ-style) without changing the kernel.
+
+On B200, dequantization costs about 1.5 instructions per weight. Each lane unpacks two weights to fp16 in one instruction (`F2FP.UNPACK_B`), then accumulates them with sm_100's mixed-precision FMA (`fma.rn.f32.f16`, SASS `FHFMA`).
+
+### Build and test on B200
+
+```bash
+cd megakernel_dynamic/cuda && python setup.py build_ext --inplace
+```
+
+```bash
+python megakernel_dynamic/test_dps.py
+```
+
+```bash
+python megakernel_dynamic/test_dps.py --backend cutedsl
+```
+
+`test_dps.py` covers every weight format and scheduler mode. For each format it checks greedy tokens against HF transformers running the same weights, then times a 128-token decode.
+
+### Status
+
+Verified on a GTX 1650 (CUDA version, atomic scheduler, emulated TMA): greedy tokens match HF transformers exactly for fp16, and for fp8/fp4 they match HF running the dequantized weights. Both versions compile cleanly for sm_100a in all three formats. The CLC path, the hardware TMA and fp8/fp4 instructions, and the CuTeDSL version still need their first run on a B200. No B200 benchmark numbers yet.
 
 ---
 

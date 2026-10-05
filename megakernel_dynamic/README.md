@@ -182,9 +182,25 @@ Done locally on a GTX 1650 (sm_75, so no CLC or TMA hardware):
   (CLC), `UBLKCP` (TMA bulk copy), `SYNCS.*` (mbarrier tx), and for fp8/fp4
   `F2FP.F16.E4M3/E2M1.UNPACK_B` + `FHFMA` in the GEMV.
 
-**Not yet run on real hardware:** the `clc` mode, the real TMA/mbarrier path, the
-hardware fp8/fp4 conversion path, and the CuTeDSL backend (CuTeDSL needs sm_80+).
-Run `test_dps.py` for both backends on the B200 first.
+First run on a B200 (2026-10-05, CUDA 13.2, PyTorch 2.14.1+cu130; raw logs in `results/`):
+
+- CUDA backend: greedy tokens identical to HF transformers (fp16) and to HF running the
+  dequantized weights (fp8/fp4) on every test prompt, with both the `atomic` and `clc`
+  schedulers. This was the first run of the CLC path, the real TMA/mbarrier path and the
+  hardware fp8/fp4 instructions.
+- Latency per token step, 23-token prompt + 128 new tokens in one launch:
+
+  | weights | `atomic` | `clc` | weight-bandwidth floor at 8 TB/s |
+  |---|---|---|---|
+  | fp16 | 1096 us | 1101 us | ~144 us |
+  | fp8 | 976 us | 941 us | ~75 us |
+  | fp4 | 1419 us | 1448 us | ~41 us |
+
+  The kernel is latency-bound, not bandwidth-bound: it runs 7-35x above the floor, fp4 is
+  slower than fp8 despite moving half the bytes, and the scheduler mode changes little.
+- CuTeDSL backend: **hangs** on its first variant (`atomic`, fp16). The kernel launches and
+  never finishes; locally the same variant compiles in ~3 s, so it is not compile time. Not
+  diagnosed yet. That run used `nvidia-cutlass-dsl` 4.8.0; the backend was written against 4.4.0.
 
 ## Limitations
 

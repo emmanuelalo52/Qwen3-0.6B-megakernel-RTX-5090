@@ -32,10 +32,10 @@ setup(
             sources=["qwen_dps_ops.cpp", "qwen_dps_megakernel.cu"],
             include_dirs=[HERE],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": ["-O3", "-std=c++20"],
                 "nvcc": [
                     "-O3",
-                    "-std=c++17",
+                    "-std=c++20",
                     f"-gencode=arch=compute_{ARCH},code=sm_{ARCH}",
                     f"-DDPS_RING_BYTES={RING_BYTES}",
                     f"-DDPS_SSTAGES={SSTAGES}",

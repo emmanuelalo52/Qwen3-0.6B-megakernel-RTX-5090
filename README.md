@@ -545,7 +545,7 @@ python megakernel_dynamic/test_dps.py --backend cutedsl
 
 ### Status
 
-Verified on a GTX 1650 (CUDA version, atomic scheduler, emulated TMA): greedy tokens match HF transformers exactly for fp16, and for fp8/fp4 they match HF running the dequantized weights. Both versions compile cleanly for sm_100a in all three formats. The CLC path, the hardware TMA and fp8/fp4 instructions, and the CuTeDSL version still need their first run on a B200. No B200 benchmark numbers yet.
+Verified on a B200 (CUDA version): greedy tokens match HF transformers exactly for fp16, and for fp8/fp4 they match HF running the dequantized weights, with both the CLC and atomic schedulers. Latency is about 1 ms per token step (CLC: fp16 1.10 ms, fp8 0.94 ms, fp4 1.45 ms). That is latency-bound rather than bandwidth-bound, so there is a lot left to gain. The CuTeDSL version hangs on B200 and is still being debugged. Details and raw logs: [`megakernel_dynamic/README.md`](megakernel_dynamic/README.md#verification-status).
 
 ---
 

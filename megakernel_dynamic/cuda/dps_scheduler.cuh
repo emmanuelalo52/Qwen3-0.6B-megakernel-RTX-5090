@@ -41,6 +41,9 @@ constexpr int kDrainBatch = 16;
 struct WorkTileInfo {
     int  tile_idx;
     bool is_valid_tile;
+#if DPS_TRACE
+    uint64_t claim_ns = 0;       // when the scheduler warp took the ticket
+#endif
 };
 
 // Producer/consumer position in a ring of barriers (cutlass.pipeline.PipelineState).
@@ -66,6 +69,9 @@ struct SchedulerStorage {
     Barrier clc_bar;             // completes when try_cancel responses land
     int4    clc_resp[kDrainBatch];
     int     work[Stages];        // ticket, or -1 = no more work
+#if DPS_TRACE
+    uint64_t claim_ns[Stages];
+#endif
 };
 
 struct SchedulerParams {
@@ -98,6 +104,9 @@ class DynamicPersistentTileScheduler {
         for (;;) {
             bar_wait(&st_->empty[prod.index], prod.phase);            // producer_acquire
             st_->work[prod.index] = work.is_valid_tile ? work.tile_idx : -1;
+#if DPS_TRACE
+            st_->claim_ns[prod.index] = work.claim_ns;
+#endif
             bar_arrive(&st_->full[prod.index]);                        // producer_commit
             prod.advance();
             if (!work.is_valid_tile) break;
@@ -109,11 +118,16 @@ class DynamicPersistentTileScheduler {
     // consumer_wait + get_current_work + consumer_release.
     __device__ WorkTileInfo get_current_work(PipelineState<Stages> &cons) {
         bar_wait(&st_->full[cons.index], cons.phase);
-        const int t = *reinterpret_cast<volatile int *>(&st_->work[cons.index]);
+        WorkTileInfo w;
+        w.tile_idx      = *reinterpret_cast<volatile int *>(&st_->work[cons.index]);
+        w.is_valid_tile = w.tile_idx >= 0;
+#if DPS_TRACE
+        w.claim_ns = *reinterpret_cast<volatile uint64_t *>(&st_->claim_ns[cons.index]);
+#endif
         __syncwarp();
         if ((threadIdx.x & 31) == 0) bar_arrive(&st_->empty[cons.index]);
         cons.advance();
-        return {t, t >= 0};
+        return w;
     }
 
   private:
@@ -139,9 +153,13 @@ class DynamicPersistentTileScheduler {
     }
 
     __device__ WorkTileInfo take_ticket() {
-        if (stop_requested()) return {-1, false};
-        const int t = static_cast<int>(atomicAdd(params_.ticket, 1u));
-        return {t, t < params_.total_tiles};
+        WorkTileInfo w;
+        w.tile_idx      = stop_requested() ? -1 : static_cast<int>(atomicAdd(params_.ticket, 1u));
+        w.is_valid_tile = w.tile_idx >= 0 && w.tile_idx < params_.total_tiles;
+#if DPS_TRACE
+        w.claim_ns = globaltimer_ns();
+#endif
+        return w;
     }
 
     __device__ bool stop_requested() const { return ld_relaxed(params_.stop_flag) != 0u; }

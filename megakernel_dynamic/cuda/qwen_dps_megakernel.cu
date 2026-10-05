@@ -144,6 +144,8 @@ struct Params {
     int   total_tiles;
     int   start_pos, max_seq, eos_token, sched_mode;
     float attn_scale;
+    QwenDpsTraceRecord *trace;   // DPS_TRACE builds only
+    int   trace_first, trace_count;
 };
 
 // Shared memory that does not depend on the weight format.
@@ -158,6 +160,7 @@ struct alignas(16) SmemCommon {
     int      x_tag;                       // which input currently sits in xs
     int      flag;
     unsigned dep_seen[C_NUM];             // last counter values observed (thread 0)
+    unsigned tr_prep, tr_wwait;           // DPS_TRACE: ns spent in input prep / weight waits this tile
 };
 
 template <int F>
@@ -176,6 +179,20 @@ struct Tile { int step, layer, phase, idx; };
 
 // small helpers
 __device__ __forceinline__ void group_bar() { dps::named_bar_sync(GROUP_BAR_ID, COMPUTE_THREADS); }
+
+// DPS_TRACE: adds the scope's duration (as seen by compute thread 0) to a per-tile counter.
+struct TraceSpan {
+#if DPS_TRACE
+    unsigned *acc;
+    uint64_t  t0;
+    __device__ explicit TraceSpan(unsigned &a) : acc(&a), t0(dps::globaltimer_ns()) {}
+    __device__ ~TraceSpan() {
+        if (threadIdx.x == 0) *acc += static_cast<unsigned>(dps::globaltimer_ns() - t0);
+    }
+#else
+    __device__ explicit TraceSpan(unsigned &) {}
+#endif
+};
 
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
@@ -452,6 +469,7 @@ __device__ void wait_dependencies(SmemCommon &S, const Params &p, const Tile &T)
 // input preparation (all compute threads, called right after a group_bar)
 // HF Qwen3RMSNorm in fp16: y = half(x * rsqrt(mean(x^2) + eps)); out = half(w * y).
 __device__ void prep_rmsnorm(SmemCommon &S, const half *src, const half *w) {
+    TraceSpan span(S.tr_prep);
     const int tid = threadIdx.x;   // 256 threads x 4 elements
     const uint2 raw = __ldcg(reinterpret_cast<const uint2 *>(src) + tid);
     const half2 *xh = reinterpret_cast<const half2 *>(&raw);
@@ -470,6 +488,7 @@ __device__ void prep_rmsnorm(SmemCommon &S, const half *src, const half *w) {
 }
 
 __device__ void prep_copy(SmemCommon &S, const half *src, int n) {
+    TraceSpan span(S.tr_prep);
     const uint4 *s = reinterpret_cast<const uint4 *>(src);
     uint4 *d = reinterpret_cast<uint4 *>(S.xs);
     for (int i = threadIdx.x; i < n / 8; i += COMPUTE_THREADS) d[i] = __ldcg(s + i);
@@ -486,6 +505,7 @@ __device__ __forceinline__ const half *layer_input(const Params &p, const Tile &
 // weight ring (consumer side)
 template <int F>
 __device__ __forceinline__ const uint8_t *stage_wait(Smem<F> &S, RingState<F> &ws) {
+    TraceSpan span(S.c.tr_wwait);
     dps::bar_wait(&S.w_full[ws.index], ws.phase);
     return S.wbuf[ws.index];
 }
@@ -815,6 +835,25 @@ __device__ void tile_lm(Smem<F> &S, const Params &p, const Tile &T, RingState<F>
     }
 }
 
+// DPS_TRACE: compute thread 0 writes one record per tile in the traced ticket range.
+__device__ void trace_tile(const Params &p, const SmemCommon &S, const dps::WorkTileInfo &w,
+                           uint64_t start, uint64_t ready) {
+#if DPS_TRACE
+    const unsigned i = static_cast<unsigned>(w.tile_idx - p.trace_first);
+    if (p.trace == nullptr || i >= static_cast<unsigned>(p.trace_count)) return;
+    QwenDpsTraceRecord r;
+    r.claim    = w.claim_ns;
+    r.start    = start;
+    r.ready    = ready;
+    r.end      = dps::globaltimer_ns();
+    r.prep_ns  = S.tr_prep;
+    r.wwait_ns = S.tr_wwait;
+    r.sm       = dps::smid();
+    r.cta      = blockIdx.x;
+    p.trace[i] = r;
+#endif
+}
+
 // warp roles
 template <int F>
 __device__ void compute_loop(Smem<F> &S, const Params &p, Scheduler<F> &sched) {
@@ -823,9 +862,17 @@ __device__ void compute_loop(Smem<F> &S, const Params &p, Scheduler<F> &sched) {
     for (;;) {
         const dps::WorkTileInfo work = sched.get_current_work(cons);
         if (!work.is_valid_tile) break;
+        uint64_t t_start = 0, t_ready = 0;
+#if DPS_TRACE
+        t_start = dps::globaltimer_ns();
+        if (threadIdx.x == 0) S.c.tr_prep = S.c.tr_wwait = 0u;
+#endif
         const Tile T = decode_tile(work.tile_idx, p);
         if (threadIdx.x == 0) wait_dependencies(S.c, p, T);
         group_bar();
+#if DPS_TRACE
+        t_ready = dps::globaltimer_ns();
+#endif
         switch (T.phase) {
         case PH_QKV:    tile_qkv<F>(S, p, T, ws); break;
         case PH_ATTN:   tile_attention(S.c, p, T); break;
@@ -834,6 +881,7 @@ __device__ void compute_loop(Smem<F> &S, const Params &p, Scheduler<F> &sched) {
         case PH_DOWN:   tile_down<F>(S, p, T, ws); break;
         default:        tile_lm<F>(S, p, T, ws); break;
         }
+        if (threadIdx.x == 0) trace_tile(p, S.c, work, t_start, t_ready);
     }
 }
 
@@ -972,6 +1020,7 @@ static cudaError_t info_impl(QwenDpsInfo *info) {
     info->tiles_per_step    = T_STEP;
     info->lm_tiles          = T_LM;
     info->max_seq_supported = ATTN_CHUNK * ATTN_SPLITS;
+    info->trace_build       = DPS_TRACE;
     return cudaSuccess;
 }
 
@@ -986,6 +1035,8 @@ static cudaError_t launch_impl(const QwenDpsLaunch *a, cudaStream_t stream, int 
     cudaError_t err = query_caps<F>(caps);
     if (err != cudaSuccess) return err;
     if (caps.ctas_per_sm < 1) return cudaErrorInvalidConfiguration;
+
+    if (a->trace && (!DPS_TRACE || a->trace_first < 0 || a->trace_count < 0)) return cudaErrorInvalidValue;
 
     int mode = a->sched_mode;
     if (mode == dps::kSchedAuto) mode = caps.clc ? dps::kSchedClc : dps::kSchedAtomic;
@@ -1028,6 +1079,9 @@ static cudaError_t launch_impl(const QwenDpsLaunch *a, cudaStream_t stream, int 
     p.eos_token   = a->eos_token;
     p.sched_mode  = mode;
     p.attn_scale  = a->attn_scale;
+    p.trace       = a->trace;
+    p.trace_first = a->trace_first;
+    p.trace_count = a->trace_count;
 
     if ((err = cudaMemsetAsync(p.sync, 0, sizeof(unsigned) * C_NUM * CSTRIDE, stream)) != cudaSuccess) return err;
     qwen_dps_kernel<F><<<(unsigned)grid, BLOCK_THREADS, sizeof(Smem<F>), stream>>>(p);

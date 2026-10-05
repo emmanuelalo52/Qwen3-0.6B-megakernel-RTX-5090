@@ -114,6 +114,7 @@ this small; the kernel only reads the packed values and scales, so a better quan
 megakernel_dynamic/
   qwen_dps.py               DpsDecoder: weight loading, MXF8/NVF4 quantization, layer table, generate()
   test_dps.py               greedy-token comparison against HF transformers + latency, per weight format
+  trace_dps.py              per-tile timeline (DPS_TRACE build): where a token step's time goes
   cuda/
     dps_arch.cuh            PTX wrappers: mbarrier, cp.async.bulk, CLC; mbarrier/TMA emulation below sm_90
     dps_scheduler.cuh       DynamicPersistentTileScheduler (port of the CuTeDSL class + fetch ring)
@@ -176,6 +177,30 @@ Tuning knobs (CUDA): `DPS_RING_BYTES` (shared memory for the weight ring, defaul
 `DPS_SSTAGES` (tiles a CTA may claim ahead at fp16, default 6; scaled up to 12 for
 the smaller fp8/fp4 tiles), plus the tile sizes at the top of `qwen_dps_megakernel.cu`.
 `cutedsl/qwen_dps_cutedsl.py` mirrors those constants.
+
+### Tracing where the time goes
+
+`DPS_TRACE=1` builds a second module, `qwen_dps_trace_C`, next to the normal one. In it,
+compute thread 0 writes one 48-byte record per tile for a chosen range of token steps:
+`%globaltimer` stamps for when the scheduler claimed the ticket, when the compute warps got
+it, when its dependencies were satisfied and when it finished, plus the time spent building
+the input vector and waiting for weight stages. The normal build is unchanged.
+
+```bash
+cd megakernel_dynamic/cuda && DPS_TRACE=1 python setup.py build_ext --inplace && cd ../..
+```
+
+```bash
+python megakernel_dynamic/trace_dps.py --formats fp16,fp8,fp4 --out-dir traces
+```
+
+`trace_dps.py` traces 8 decode steps per format and scheduler, then prints three views:
+the mean cost of a tile in each phase split into queue / dependency wait / input prep /
+weight wait / the rest; the critical path of a step (28 x QKV -> attention -> O -> gate/up
+-> down, then the LM head), with each link's share of the step time and the hand-off delay
+between phases; and how SM time divides between running tiles, waiting on dependencies and
+sitting between tiles. It also times the same decode on the normal build, so the tracing
+overhead is visible. `--load traces/*.npz` re-runs the analysis on saved traces without a GPU.
 
 ## Verification status
 

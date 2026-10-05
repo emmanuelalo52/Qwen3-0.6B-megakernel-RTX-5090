@@ -22,6 +22,11 @@
 #define DPS_HAS_CLC 0
 #endif
 
+// DPS_TRACE=1 (setup.py builds it as qwen_dps_trace_C) records per-tile timestamps.
+#ifndef DPS_TRACE
+#define DPS_TRACE 0
+#endif
+
 namespace dps {
 
 __device__ __forceinline__ uint32_t smem_u32(const void *p) {
@@ -210,6 +215,19 @@ __device__ __forceinline__ void named_bar_sync(int id, int nthreads) {
 
 __device__ __forceinline__ void nanosleep_ns(unsigned ns) {
     asm volatile("nanosleep.u32 %0;" :: "r"(ns));
+}
+
+// Tracing: a device-wide nanosecond clock (comparable across SMs) and the SM id.
+__device__ __forceinline__ uint64_t globaltimer_ns() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+__device__ __forceinline__ unsigned smid() {
+    unsigned s;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(s));
+    return s;
 }
 
 }  // namespace dps

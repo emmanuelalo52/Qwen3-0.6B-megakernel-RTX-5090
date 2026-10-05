@@ -529,6 +529,16 @@ On B200, dequantization costs about 1.5 instructions per weight. Each lane unpac
 
 ### Build and test on B200
 
+Install a PyTorch build for the same CUDA major version as `nvcc` (here CUDA 13), and pin CuTeDSL to the version the backend was written against:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+```
+
+```bash
+pip install numpy transformers nvidia-cutlass-dsl==4.4.0
+```
+
 ```bash
 cd megakernel_dynamic/cuda && python setup.py build_ext --inplace
 ```
@@ -541,7 +551,7 @@ python megakernel_dynamic/test_dps.py
 python megakernel_dynamic/test_dps.py --backend cutedsl
 ```
 
-`test_dps.py` covers every weight format and scheduler mode. For each format it checks greedy tokens against HF transformers running the same weights, then times a 128-token decode.
+`test_dps.py` covers every weight format and scheduler mode. For each format it checks greedy tokens against HF transformers running the same weights, then times a 128-token decode. A 60 s watchdog per kernel call (`--timeout`) makes a hung kernel exit instead of holding the GPU.
 
 ### Status
 

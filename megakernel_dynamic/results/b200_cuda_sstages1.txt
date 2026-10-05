@@ -1,0 +1,9 @@
+# B200, 2026-10-05. CUDA backend built with DPS_SSTAGES=1 (claim-ahead 1; fp4 scales it to 3):
+#   cd megakernel_dynamic/cuda && DPS_SSTAGES=1 python setup.py build_ext --inplace
+#   python megakernel_dynamic/test_dps.py --formats fp16,fp4 --sched clc --max-new 8 | grep -E "#####|latency|PASS|FAIL"
+# Transcribed from the terminal (the run was not tee'd); default-build numbers for comparison are in b200_cuda.txt.
+##### weights=fp16  [NVIDIA B200] stage=32768 B x 6, claim-ahead 1, smem 212864 B
+  latency: 123.7 ms for 23-token prompt + 128 new tokens (825 us per token step, single launch)
+##### weights=fp4  [NVIDIA B200] stage=9216 B x 16, claim-ahead 3, smem 164096 B
+  latency: 142.0 ms for 23-token prompt + 128 new tokens (947 us per token step, single launch)
+PASS

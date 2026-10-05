@@ -202,6 +202,67 @@ between phases; and how SM time divides between running tiles, waiting on depend
 sitting between tiles. It also times the same decode on the normal build, so the tracing
 overhead is visible. `--load traces/*.npz` re-runs the analysis on saved traces without a GPU.
 
+## B200 benchmarks
+
+One vast.ai B200 (148 SMs), CUDA 13.2, PyTorch 2.14.1+cu130, batch 1, greedy decoding, the whole
+request in one launch. CUDA backend only (the CuTeDSL backend does not run yet, see
+[Verification status](#verification-status)). Raw logs and traces are in `results/`.
+
+### Latency per token step
+
+`test_dps.py`: 23-token prompt + 128 new tokens in one launch, total time divided by the 150
+token steps (the 22 prefill steps skip the LM head). 1000 us per step is about 1000 tokens/s.
+
+| weights | `atomic` | `clc` | `clc`, claim-ahead 1 | weight-bandwidth floor at 8 TB/s |
+|---|---|---|---|---|
+| fp16 | 1096 us | 1101 us | **825 us** (-25%) | ~144 us |
+| fp8 | 976 us | 941 us | not measured | ~75 us |
+| fp4 | 1419 us | 1448 us | **947 us** (-35%, claim-ahead 3) | ~41 us |
+
+Claim-ahead is how many tiles each CTA claims before it needs them (`DPS_SSTAGES`, default 6,
+scaled up to 12 for the smaller fp8/fp4 tiles). The last column was built with
+`DPS_SSTAGES=1 python setup.py build_ext --inplace` and gives the same tokens. It is not the
+default yet: fp8 and the `atomic` scheduler have not been measured with it.
+
+### Where a token step goes
+
+`trace_dps.py` with the default claim-ahead: every tile of 8 decode steps, taken after the
+first 16 decode steps of the launch. "Untraced" is the same decode on the normal build.
+
+| weights, scheduler | decode step, untraced | traced | SM time running tiles | waiting on dependencies |
+|---|---|---|---|---|
+| fp16, `atomic` | 1064 us | 1110 us | 37% | 60% |
+| fp16, `clc` | 1076 us | 1128 us | 37% | 61% |
+| fp8, `atomic` | 952 us | 986 us | 40% | 56% |
+| fp8, `clc` | 939 us | 983 us | 40% | 56% |
+| fp4, `atomic` | 1278 us | 1302 us | 29% | 68% |
+| fp4, `clc` | 1236 us | 1349 us | 28% | 69% |
+
+Per tile, the parts that look expensive are cheap: the weights are already in shared memory
+when a tile needs them (mean wait ~0.04 us), a tile takes ~1.5-1.9 us from inputs ready to
+done, and the hand-off between phases (last tile of one phase done -> first tile of the next
+ready) is ~0.25 us. Yet each phase lasts 6-12 us, because its tiles are spread unevenly:
+
+| phase (fp16, `clc`) | tiles | even share per SM | tiles on the busiest SM | SMs used | phase duration |
+|---|---|---|---|---|---|
+| QKV | 256 | 1.7 | 4.0 | 148 | 7.9 us |
+| attention | 64 | 0.4 | 1.0 | 64 | 10.5 us |
+| O-proj | 128 | 0.9 | 3.0 | 96 | 6.2 us |
+| gate/up | 384 | 2.6 | 4.8 | 148 | 9.8 us |
+| down | 256 | 1.7 | 4.1 | 148 | 7.6 us |
+
+(Phase duration = first tile ready to last tile done, mean over 28 layers x 8 steps. Attention
+has one tile per SM; its duration follows the per-head QKV groups it waits on.)
+
+Each phase lasts about as long as its busiest SM needs: 4 tiles x ~1.7 us. The cause is
+claim-ahead. Every CTA claims its next 6-12 tickets in advance so the TMA warp can prefetch
+their weights. Across 148 CTAs that is one to two layers' worth of tiles (1088 per layer)
+handed out before it is known which will become ready first. When a phase opens, some SMs
+hold 2-3x their share and others none. With fp4 (claim-ahead 12) it is worst: the busiest SM averages 5.6 QKV tiles against a share
+of 1.7. Claiming one tile ahead should keep the hand-out close to even, which is the likely
+source of the 25-35% above; a trace with claim-ahead 1 has not been taken yet. The CLC and
+atomic schedulers behave the same here, because both claim ahead the same way.
+
 ## Verification status
 
 Done locally on a GTX 1650 (sm_75, so no CLC or TMA hardware):
@@ -220,25 +281,18 @@ Done locally on a GTX 1650 (sm_75, so no CLC or TMA hardware):
   (CLC), `UBLKCP` (TMA bulk copy), `SYNCS.*` (mbarrier tx), and for fp8/fp4
   `F2FP.F16.E4M3/E2M1.UNPACK_B` + `FHFMA` in the GEMV.
 
-First run on a B200 (2026-10-05, CUDA 13.2, PyTorch 2.14.1+cu130; raw logs in `results/`):
+On a B200 (2026-10-05, CUDA 13.2, PyTorch 2.14.1+cu130; raw logs in `results/`):
 
 - CUDA backend: greedy tokens identical to HF transformers (fp16) and to HF running the
   dequantized weights (fp8/fp4) on every test prompt, with both the `atomic` and `clc`
-  schedulers. This was the first run of the CLC path, the real TMA/mbarrier path and the
-  hardware fp8/fp4 instructions.
-- Latency per token step, 23-token prompt + 128 new tokens in one launch:
-
-  | weights | `atomic` | `clc` | weight-bandwidth floor at 8 TB/s |
-  |---|---|---|---|
-  | fp16 | 1096 us | 1101 us | ~144 us |
-  | fp8 | 976 us | 941 us | ~75 us |
-  | fp4 | 1419 us | 1448 us | ~41 us |
-
-  The kernel is latency-bound, not bandwidth-bound: it runs 7-35x above the floor, fp4 is
-  slower than fp8 despite moving half the bytes, and the scheduler mode changes little.
-- CuTeDSL backend: **hangs** on its first variant (`atomic`, fp16). The kernel launches and
-  never finishes; locally the same variant compiles in ~3 s, so it is not compile time. Not
-  diagnosed yet. That run used `nvidia-cutlass-dsl` 4.8.0; the backend was written against 4.4.0.
+  schedulers, and again with claim-ahead 1. This was the first run of the CLC path, the real
+  TMA/mbarrier path and the hardware fp8/fp4 instructions. Timings: [B200 benchmarks](#b200-benchmarks).
+- CuTeDSL backend: **deadlocks** on its first variant (`atomic`, fp16), with CuTeDSL 4.4.0 and
+  4.8.0 alike. It compiles and launches in ~1.5 s, then the GPU spins at 100%.
+  `hang_probe.py` read the progress counters during the hang (`results/hang_probe.txt`):
+  layer 0's QKV finished, attention finished 45 of 64 tiles although all their inputs were
+  ready, and O-proj onward never started. Meanwhile 47 QKV tiles of layer 1 ran although layer
+  0's down projection had not, so some tiles skip their dependency wait. Not fixed yet.
 
 ## Limitations
 

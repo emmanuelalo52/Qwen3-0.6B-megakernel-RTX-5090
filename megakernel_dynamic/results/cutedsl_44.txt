@@ -1,0 +1,17 @@
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  81%|████████  | 252/311 [00:00<00:00, 2504.71it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 1990.05it/s]
+
+##### weights=fp16  [NVIDIA B200] stage=32768 B x 6, claim-ahead 6, smem ? B
+=== backend=cutedsl scheduler=atomic weights=fp16
+Timeout (0:01:00)!
+Thread 0x00007c035ffff6c0 (most recent call first):
+  File "/venv/main/lib/python3.12/threading.py", line 359 in wait
+  File "/venv/main/lib/python3.12/threading.py", line 655 in wait
+  File "/venv/main/lib/python3.12/site-packages/tqdm/_monitor.py", line 69 in run
+  File "/venv/main/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/venv/main/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x00007c09da31c740 (most recent call first):
+  File "/workspace/Qwen3-0.6B-megakernel-RTX-5090/megakernel_dynamic/qwen_dps.py", line 294 in generate_ids
+  File "/workspace/Qwen3-0.6B-megakernel-RTX-5090/megakernel_dynamic/test_dps.py", line 129 in run_format
+  File "/workspace/Qwen3-0.6B-megakernel-RTX-5090/megakernel_dynamic/test_dps.py", line 182 in main
+  File "/workspace/Qwen3-0.6B-megakernel-RTX-5090/megakernel_dynamic/test_dps.py", line 188 in <module>

@@ -5,7 +5,8 @@
 
 Launches one generate (compile + launch return without waiting for the GPU), then copies the
 global sync counters to the host on a separate non-blocking stream, which runs on the copy
-engines and does not wait for the kernel. Reads them --reads times, --interval s apart, so it
+engines and does not wait for the kernel. The stream and the pinned host buffer are created
+before the launch: creating either while the kernel runs can wait for it. Reads them --reads times, --interval s apart, so it
 also shows whether anything still moves, then exits; process exit kills a hung kernel.
 """
 
@@ -15,6 +16,7 @@ import os
 import sys
 import time
 
+import cuda.bindings.runtime as rt
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,6 +71,10 @@ def main():
     tokens = torch.empty(n_prompt + args.max_new, dtype=torch.int32, device="cuda")
     tokens[:n_prompt].copy_(torch.tensor(ids, dtype=torch.int32))
     out = torch.full((args.max_new,), -1, dtype=torch.int32, device="cuda")
+    sync = dec.ext.ws[:q.SYNC_BYTES].view(torch.int32)
+    host = torch.empty(sync.numel(), dtype=torch.int32, pin_memory=True)
+    err, side = rt.cudaStreamCreateWithFlags(rt.cudaStreamNonBlocking)
+    assert err == rt.cudaError_t.cudaSuccess, err
     torch.cuda.synchronize()
 
     faulthandler.dump_traceback_later(60 + args.reads * args.interval, exit=True)   # if the probe itself blocks
@@ -77,15 +83,12 @@ def main():
     print(f"{args.format} {args.sched}: compiled + launched in {time.perf_counter() - t0:.1f} s; "
           f"prompt {n_prompt} tokens -> {n_pre} prefill steps, {total} tiles in the launch")
 
-    side = torch.cuda.Stream()
-    sync = dec.ext.ws[:q.SYNC_BYTES].view(torch.int32)
-    host = torch.empty(sync.numel(), dtype=torch.int32, pin_memory=True)
     prev = None
     for r in range(args.reads):
         time.sleep(args.interval)
-        with torch.cuda.stream(side):
-            host.copy_(sync, non_blocking=True)
-        side.synchronize()
+        rt.cudaMemcpyAsync(host.data_ptr(), sync.data_ptr(), q.SYNC_BYTES,
+                           rt.cudaMemcpyKind.cudaMemcpyDeviceToHost, side)
+        rt.cudaStreamSynchronize(side)
         vals = host[::q.CSTRIDE].tolist()
         moved = "" if prev is None else ("  (still moving)" if vals != prev else "  (no change since last read)")
         print(f"\nread {r + 1} at +{time.perf_counter() - t0:.1f} s{moved}")

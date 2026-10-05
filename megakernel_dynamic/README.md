@@ -125,8 +125,19 @@ megakernel_dynamic/
 
 ## Build and run on the B200 server
 
-Requires CUDA 12.8+ (13.x tested for compilation), PyTorch with CUDA, `transformers`,
-and `nvidia-cutlass-dsl>=4.4` for the CuTeDSL backend.
+Requires CUDA 12.8+ (the B200 run used 13.2), PyTorch with CUDA, `transformers`, and
+`nvidia-cutlass-dsl==4.4.0` for the CuTeDSL backend. 4.4.0 is the version the backend
+was written against; keep it pinned until the hang seen with 4.8.0 is understood.
+PyTorch must be built for the same CUDA major version as `nvcc`, or the extension
+build refuses to run, so on a CUDA 13 machine install the `cu130` wheel:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+```
+
+```bash
+pip install numpy transformers nvidia-cutlass-dsl==4.4.0
+```
 
 ```bash
 cd megakernel_dynamic/cuda && python setup.py build_ext --inplace
@@ -145,7 +156,9 @@ mode the GPU supports. Each format is checked against HF running the same weight
 the fp16 model for fp16, and the model with dequantized weights for fp8/fp4. That
 isolates kernel bugs from quantization error. It also prints how many leading tokens
 still agree with the fp16 model, and times a 128-token decode with EOS disabled
-(`--bench-tokens N` to change it). `DPS_ARCH=120a` builds for an RTX 5090. On any
+(`--bench-tokens N` to change it). Each kernel call runs under a 60 s watchdog
+(`--timeout S`, 0 turns it off): a hung kernel prints the Python stacks and exits
+instead of holding the GPU. `DPS_ARCH=120a` builds for an RTX 5090. On any
 other GPU `DPS_ARCH=<cc>` builds the atomic scheduler with emulated TMA.
 
 Using it from Python (same `generate()` contract as `Model/Qwen06B_architecture.Decoder`):
@@ -182,9 +195,25 @@ Done locally on a GTX 1650 (sm_75, so no CLC or TMA hardware):
   (CLC), `UBLKCP` (TMA bulk copy), `SYNCS.*` (mbarrier tx), and for fp8/fp4
   `F2FP.F16.E4M3/E2M1.UNPACK_B` + `FHFMA` in the GEMV.
 
-**Not yet run on real hardware:** the `clc` mode, the real TMA/mbarrier path, the
-hardware fp8/fp4 conversion path, and the CuTeDSL backend (CuTeDSL needs sm_80+).
-Run `test_dps.py` for both backends on the B200 first.
+First run on a B200 (2026-10-05, CUDA 13.2, PyTorch 2.14.1+cu130; raw logs in `results/`):
+
+- CUDA backend: greedy tokens identical to HF transformers (fp16) and to HF running the
+  dequantized weights (fp8/fp4) on every test prompt, with both the `atomic` and `clc`
+  schedulers. This was the first run of the CLC path, the real TMA/mbarrier path and the
+  hardware fp8/fp4 instructions.
+- Latency per token step, 23-token prompt + 128 new tokens in one launch:
+
+  | weights | `atomic` | `clc` | weight-bandwidth floor at 8 TB/s |
+  |---|---|---|---|
+  | fp16 | 1096 us | 1101 us | ~144 us |
+  | fp8 | 976 us | 941 us | ~75 us |
+  | fp4 | 1419 us | 1448 us | ~41 us |
+
+  The kernel is latency-bound, not bandwidth-bound: it runs 7-35x above the floor, fp4 is
+  slower than fp8 despite moving half the bytes, and the scheduler mode changes little.
+- CuTeDSL backend: **hangs** on its first variant (`atomic`, fp16). The kernel launches and
+  never finishes; locally the same variant compiles in ~3 s, so it is not compile time. Not
+  diagnosed yet. That run used `nvidia-cutlass-dsl` 4.8.0; the backend was written against 4.4.0.
 
 ## Limitations
 

@@ -529,6 +529,16 @@ On B200, dequantization costs about 1.5 instructions per weight. Each lane unpac
 
 ### Build and test on B200
 
+Install a PyTorch build for the same CUDA major version as `nvcc` (here CUDA 13), and pin CuTeDSL to the version the backend was written against:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+```
+
+```bash
+pip install numpy transformers nvidia-cutlass-dsl==4.4.0
+```
+
 ```bash
 cd megakernel_dynamic/cuda && python setup.py build_ext --inplace
 ```
@@ -541,11 +551,11 @@ python megakernel_dynamic/test_dps.py
 python megakernel_dynamic/test_dps.py --backend cutedsl
 ```
 
-`test_dps.py` covers every weight format and scheduler mode. For each format it checks greedy tokens against HF transformers running the same weights, then times a 128-token decode.
+`test_dps.py` covers every weight format and scheduler mode. For each format it checks greedy tokens against HF transformers running the same weights, then times a 128-token decode. A 60 s watchdog per kernel call (`--timeout`) makes a hung kernel exit instead of holding the GPU.
 
 ### Status
 
-Verified on a GTX 1650 (CUDA version, atomic scheduler, emulated TMA): greedy tokens match HF transformers exactly for fp16, and for fp8/fp4 they match HF running the dequantized weights. Both versions compile cleanly for sm_100a in all three formats. The CLC path, the hardware TMA and fp8/fp4 instructions, and the CuTeDSL version still need their first run on a B200. No B200 benchmark numbers yet.
+Verified on a B200 (CUDA version): greedy tokens match HF transformers exactly for fp16, and for fp8/fp4 they match HF running the dequantized weights, with both the CLC and atomic schedulers. Latency is about 1 ms per token step (CLC: fp16 1.10 ms, fp8 0.94 ms, fp4 1.45 ms). That is latency-bound rather than bandwidth-bound, so there is a lot left to gain. The CuTeDSL version hangs on B200 and is still being debugged. Details and raw logs: [`megakernel_dynamic/README.md`](megakernel_dynamic/README.md#verification-status).
 
 ---
 

@@ -1,0 +1,4 @@
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  86%|████████▋ | 269/311 [00:00<00:00, 2663.39it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2826.47it/s]
+
+##### weights=fp16  [NVIDIA B200] stage=32768 B x 6, claim-ahead 6, smem ? B
+=== backend=cutedsl scheduler=atomic weights=fp16

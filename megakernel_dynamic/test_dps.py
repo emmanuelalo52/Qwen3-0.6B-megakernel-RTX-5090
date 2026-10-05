@@ -12,9 +12,14 @@ separately as agreement with the fp16 model.
 
 Small fp16 accumulation differences can flip a near-tie late in a sequence, so the
 report shows how many leading tokens match rather than demanding an exact match.
+
+Every kernel call runs under a watchdog (--timeout, default 60 s, 0 = off): a hung
+kernel prints the Python stacks and exits instead of blocking a rented GPU.
 """
 
 import argparse
+import contextlib
+import faulthandler
 import os
 import re
 import sys
@@ -64,6 +69,22 @@ def matching_prefix(a, b):
     return n
 
 
+@contextlib.contextmanager
+def watchdog(seconds):
+    """Exit the process if the block runs longer than `seconds` (0 = no limit).
+    A hung kernel blocks the host inside a CUDA sync, where Ctrl+C does not reach it.
+    faulthandler's timer runs on its own C thread, so it still fires: it prints every
+    thread's stack and exits, and the driver tears down the context and the kernel."""
+    if seconds <= 0:
+        yield
+        return
+    faulthandler.dump_traceback_later(seconds, exit=True)
+    try:
+        yield
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
 @torch.no_grad()
 def apply_fake_quant(model, weights):
     """Overwrite the HF model in place with the dequantized matrices the kernel uses.
@@ -104,7 +125,8 @@ def run_format(fmt, args, tok, eos):
         dec = DpsDecoder(weights, tok, backend=args.backend, sched=sched)
         print(f"=== backend={args.backend} scheduler={sched} weights={fmt}")
         for ids, ref, base in zip(prompts, refs, fp16_ref):
-            got = dec.generate_ids(ids, args.max_new, eos)
+            with watchdog(args.timeout):   # the first call also JIT-compiles the CuTeDSL kernel
+                got = dec.generate_ids(ids, args.max_new, eos)
             n = matching_prefix(ref, got)
             mode, grid = dec.last_launch
             status = "OK " if n == len(ref) == len(got) else ("~  " if n >= min(len(ref), len(got)) // 2 else "BAD")
@@ -120,12 +142,13 @@ def run_format(fmt, args, tok, eos):
             continue   # one CTA launch per tile: correctness only
         # Latency: EOS disabled so every run decodes exactly bench_tokens.
         ids = prompts[1]
-        dec.generate_ids(ids, 8, None)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        dec.generate_ids(ids, args.bench_tokens, None)
-        torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
+        with watchdog(args.timeout):
+            dec.generate_ids(ids, 8, None)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            dec.generate_ids(ids, args.bench_tokens, None)
+            torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
         steps = len(ids) - 1 + args.bench_tokens
         print(f"  latency: {dt * 1e3:.1f} ms for {len(ids)}-token prompt + {args.bench_tokens} new tokens "
               f"({dt / steps * 1e6:.0f} us per token step, single launch)")
@@ -145,7 +168,11 @@ def main():
     ap.add_argument("--max-new", type=int, default=48)
     ap.add_argument("--bench-tokens", type=int, default=128)
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    ap.add_argument("--timeout", type=float, default=60.0,
+                    help="seconds one kernel call may take before the test exits (0 = no limit)")
     args = ap.parse_args()
+    # Flush every line, so `| tee` shows progress and nothing is lost if the watchdog exits.
+    sys.stdout.reconfigure(line_buffering=True)
 
     from transformers import AutoTokenizer
 

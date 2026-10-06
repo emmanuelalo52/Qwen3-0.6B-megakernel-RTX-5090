@@ -33,6 +33,10 @@ TEMPERATURE  = float(os.getenv("TEMPERATURE",  "0.0"))
 LOG_FILE     = os.getenv("LOG_FILE",           "latency_log_baseline.json")
 # Make CONCURRENCY configurable via .env; default kept as 1 to preserve previous behavior.
 CONCURRENCY  = int(os.getenv("CONCURRENCY", "1"))
+# Which server this run measures; written to the log so runs can be compared later.
+SERVER_LABEL = os.getenv("SERVER_LABEL", "vLLM standard CUDA baseline")
+# Untimed requests sent first, so the first timed request is not a cold one.
+WARMUP       = int(os.getenv("WARMUP", "0"))
 
 # api_key is required by the SDK but vLLM does not validate it.
 client = OpenAI(
@@ -42,7 +46,7 @@ client = OpenAI(
 
 def server_timeout(timeout:int = 180):
     import urllib.request
-    print(f"[client] waiting for vLLM server at {HOST}", end="",flush=True)
+    print(f"[client] waiting for server at {HOST}", end="",flush=True)
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -68,11 +72,12 @@ def send_request(questions:str):
     )
     latency_stop = time.perf_counter() - t0
     answer        = response.choices[0].message.content
+    finish_reason = response.choices[0].finish_reason
     # note: response.usage may be None for some servers; guard just in case
     prompt_tokens = getattr(response.usage, "prompt_tokens", 0) if getattr(response, "usage", None) else 0
     output_tokens = getattr(response.usage, "completion_tokens", 0) if getattr(response, "usage", None) else 0
 
-    return answer, latency_stop, prompt_tokens, output_tokens
+    return answer, latency_stop, prompt_tokens, output_tokens, finish_reason
 
 def run_benchmark() -> None:
     print("=" * 65)
@@ -81,17 +86,21 @@ def run_benchmark() -> None:
     print(f"  Server           : {HOST}")
     print(f"  Model            : {MODEL}")
     print(f"  Client           : openai SDK  (vLLM-compatible)")
-    print(f"  Kernel           : vLLM standard CUDA  (baseline)")
-    print(f"  dtype            : float16")
+    print(f"  Server           : {SERVER_LABEL}")
+    print(f"  dtype            : {os.getenv('DTYPE', 'float16')}")
     print(f"  Requests         : {NUM_REQUESTS}")
     mode = "sequential" if CONCURRENCY <= 1 else "parallel"
     print(f"  Concurrency      : {CONCURRENCY}  ({mode})")
     print(f"  Max tokens/reply : {MAX_TOKENS}")
     print(f"  Temperature      : {TEMPERATURE}  (greedy)")
+    print(f"  Warm-up requests : {WARMUP}  (not timed)")
     print(f"  Log file         : {LOG_FILE}")
     print("=" * 65 + "\n")
 
     server_timeout()
+    for i in range(WARMUP):
+        send_request(PROMPTS[i % len(PROMPTS)])
+    run_t0 = time.perf_counter()
 
     print(f"  {'Req':>3}  {'Latency (s)':>11}  {'In tok':>6}  {'Out tok':>7}  Question")
     print("  " + "-" * 63)
@@ -114,7 +123,7 @@ def run_benchmark() -> None:
                 i = future_to_index[future]
                 question = PROMPTS[i]
                 try:
-                    answer, latency_s, p_tok, o_tok = future.result()
+                    answer, latency_s, p_tok, o_tok, finish = future.result()
                     latencies.append(latency_s)
                     log.append({
                         "index":         i,
@@ -123,6 +132,7 @@ def run_benchmark() -> None:
                         "latency_s":     round(latency_s, 4),
                         "prompt_tokens": p_tok,
                         "output_tokens": o_tok,
+                        "finish_reason": finish,
                         "error":         None,
                     })
                     print(f"  {i+1:>3}  {latency_s:>11.3f}s  {p_tok:>6}  {o_tok:>7}  {question[:35]}")
@@ -140,7 +150,7 @@ def run_benchmark() -> None:
         for i in range(NUM_REQUESTS):
             question = PROMPTS[i]
             try:
-                answer, latency_s, p_tok, o_tok = send_request(question)
+                answer, latency_s, p_tok, o_tok, finish = send_request(question)
                 latencies.append(latency_s)
                 log.append({
                     "index":         i,
@@ -149,6 +159,7 @@ def run_benchmark() -> None:
                     "latency_s":     round(latency_s, 4),
                     "prompt_tokens": p_tok,
                     "output_tokens": o_tok,
+                    "finish_reason": finish,
                     "error":         None,
                 })
                 print(f"  {i+1:>3}  {latency_s:>11.3f}s  {p_tok:>6}  {o_tok:>7}  {question[:35]}")
@@ -168,6 +179,8 @@ def run_benchmark() -> None:
     else:
         run_sequential()
 
+    wall_time = time.perf_counter() - run_t0
+
     # Summary
     valid      = [l for l in latencies]
     failed     = NUM_REQUESTS - len(valid)
@@ -177,9 +190,17 @@ def run_benchmark() -> None:
     minimum    = min(valid)                   if valid else 0
     maximum    = max(valid)                   if valid else 0
     throughput = len(valid) / sum(valid)      if valid else 0
+    p90        = statistics.quantiles(valid, n=10)[-1] if len(valid) > 1 else maximum
+    # Token metrics. Output tokens are the server's usage.completion_tokens.
+    ok         = [r for r in log if r["error"] is None and r["latency_s"]]
+    out_tokens = sum(r["output_tokens"] for r in ok)
+    mean_out   = out_tokens / len(ok)                                       if ok else 0
+    tok_s      = statistics.mean(r["output_tokens"] / r["latency_s"] for r in ok) if ok else 0
+    e2e_tok_s  = out_tokens / sum(r["latency_s"] for r in ok)                if ok else 0
+    wall_rps   = len(ok) / wall_time                                        if ok else 0
 
     print("\n" + "=" * 65)
-    print("LATENCY SUMMARY  vLLM standard CUDA baseline  float16")
+    print(f"LATENCY SUMMARY  {SERVER_LABEL}")
     print("=" * 65)
     print(f"  Requests sent      : {NUM_REQUESTS}")
     print(f"  Successful         : {len(valid)}")
@@ -189,18 +210,25 @@ def run_benchmark() -> None:
     print(f"  Std deviation      : {std:.3f} s")
     print(f"  Min latency        : {minimum:.3f} s")
     print(f"  Max latency        : {maximum:.3f} s")
+    print(f"  P90 latency        : {p90:.3f} s")
     print(f"  Throughput         : {throughput:.2f} req/s")
+    print(f"  Output tokens      : {out_tokens}  ({mean_out:.1f} per request)")
+    print(f"  Tokens/s           : {tok_s:.1f}   (mean of output tokens / latency per request)")
+    print(f"  End-to-end tok/s   : {e2e_tok_s:.1f}   (all output tokens / all request time)")
+    print(f"  Wall time          : {wall_time:.2f} s  ({wall_rps:.2f} req/s incl. client overhead)")
     print("=" * 65)
 
     # Save log
     output = {
         "meta": {
-            "step":        "Step 2  vLLM standard CUDA baseline",
+            "step":        SERVER_LABEL,
+            "label":       SERVER_LABEL,
             "server":      HOST,
             "model":       MODEL,
             "client":      "openai SDK",
-            "dtype":       "float16",
-            "kernel":      "vLLM standard CUDA PagedAttention",
+            "dtype":       os.getenv("DTYPE", "float16"),
+            "kernel":      SERVER_LABEL,
+            "warmup":      WARMUP,
             "concurrency": CONCURRENCY,
             "max_tokens":  MAX_TOKENS,
             "temperature": TEMPERATURE,
@@ -215,6 +243,13 @@ def run_benchmark() -> None:
             "min_latency_s":    round(minimum,    4),
             "max_latency_s":    round(maximum,    4),
             "throughput_rps":   round(throughput, 4),
+            "p90_latency_s":    round(p90,        4),
+            "output_tokens":    out_tokens,
+            "mean_output_tokens": round(mean_out, 2),
+            "tokens_per_s":     round(tok_s,      2),
+            "e2e_tokens_per_s": round(e2e_tok_s,  2),
+            "wall_time_s":      round(wall_time,  4),
+            "wall_rps":         round(wall_rps,   4),
         },
         "requests": log,
     }
@@ -223,8 +258,7 @@ def run_benchmark() -> None:
         json.dump(output, f, indent=2)
 
     print(f"\n[client] Log saved to {LOG_FILE}")
-    print("[client] avg_latency_s in this file is your Step 2 baseline number.")
-    print("[client] For Step 3: point HOST in .env at the megakernel server and rerun.\n")
+    print("[client] Compare two runs with: python compare_benchmarks.py <megakernel log> <baseline log>\n")
 
 
 if __name__ == "__main__":

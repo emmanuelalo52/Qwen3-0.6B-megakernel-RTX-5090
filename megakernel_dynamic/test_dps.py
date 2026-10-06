@@ -101,6 +101,12 @@ def layer_w(weights, i, name):
     return weights["layers"][i][name]
 
 
+def default_scheds(backend, info):
+    """Every scheduler the backend and GPU support (static is CUDA-only)."""
+    scheds = ["atomic", "static"] if backend == "cuda" else ["atomic"]
+    return scheds + (["clc"] if info["clc_supported"] else [])
+
+
 def run_format(fmt, args, tok, eos):
     from transformers import AutoModelForCausalLM
 
@@ -118,7 +124,7 @@ def run_format(fmt, args, tok, eos):
     del probe
     print(f"\n##### weights={fmt}  [{torch.cuda.get_device_name()}] stage={info['stage_bytes']} B x "
           f"{info['weight_stages']}, claim-ahead {info['sched_stages']}, smem {info.get('smem_bytes', '?')} B")
-    scheds = [args.sched] if args.sched else (["atomic", "clc"] if info["clc_supported"] else ["atomic"])
+    scheds = [args.sched] if args.sched else default_scheds(args.backend, info)
 
     ok = True
     for sched in scheds:
@@ -162,8 +168,8 @@ def run_format(fmt, args, tok, eos):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", default="cuda", choices=["cuda", "cutedsl"])
-    ap.add_argument("--sched", default=None, choices=["atomic", "clc", "oneshot"],
-                    help="default: every supported mode; oneshot = CLC launch pattern without CLC (test only)")
+    ap.add_argument("--sched", default=None, choices=["atomic", "static", "clc", "oneshot"],
+                    help="default: every supported mode (static: CUDA only); oneshot = CLC launch pattern without CLC (test only)")
     ap.add_argument("--formats", default="fp16,fp8,fp4", help="comma-separated subset of fp16,fp8,fp4")
     ap.add_argument("--max-new", type=int, default=48)
     ap.add_argument("--bench-tokens", type=int, default=128)

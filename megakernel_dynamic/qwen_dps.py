@@ -32,8 +32,8 @@ NUM_KV_HEADS = 8
 HEAD_DIM = 128
 MAX_SEQ_LEN = 2048
 ROPE_THETA = 1_000_000.0
-SCHED_MODES = {"auto": 0, "atomic": 1, "clc": 2, "oneshot": 3}
-SCHED_NAMES = {1: "atomic", 2: "clc", 3: "oneshot"}
+SCHED_MODES = {"auto": 0, "atomic": 1, "clc": 2, "oneshot": 3, "static": 4}
+SCHED_NAMES = {1: "atomic", 2: "clc", 3: "oneshot", 4: "static"}
 WEIGHT_FORMATS = {"fp16": 0, "fp8": 1, "fp4": 2}
 
 # One projection matrix: data [rows, K] (fp16 | e4m3 bytes | packed e2m1),
@@ -186,20 +186,36 @@ def pack_layer_table(layers) -> torch.Tensor:
     return torch.tensor(slots, dtype=torch.int64, device="cuda")
 
 
-def _cuda_ext():
+def _cuda_ext(trace: bool = False):
     path = os.path.join(HERE, "cuda")
     if path not in sys.path:
         sys.path.insert(0, path)
+    if trace:
+        import qwen_dps_trace_C
+
+        return qwen_dps_trace_C
     import qwen_dps_C
 
     return qwen_dps_C
+
+
+# QwenDpsTraceRecord (cuda/qwen_dps.h): %globaltimer ns per tile, plus SM and CTA.
+TRACE_FIELDS = [("claim", "<u8"), ("start", "<u8"), ("ready", "<u8"), ("end", "<u8"),
+                ("prep_ns", "<u4"), ("wwait_ns", "<u4"), ("sm", "<u4"), ("cta", "<u4")]
+TRACE_RECORD_BYTES = 48
+
+
+def first_ticket(step: int, n_pre: int, tiles_per_step: int, lm_tiles: int) -> int:
+    """Ticket of the first tile of launch-relative token `step`. Tickets run
+    [n_pre prefill steps x tiles_per_step] [decode steps x (tiles_per_step + lm_tiles)]."""
+    return step * tiles_per_step + max(0, step - n_pre) * lm_tiles
 
 
 class DpsDecoder:
     """Stateless-per-request decoder: every generate() call is one kernel launch."""
 
     def __init__(self, weights: dict, tokenizer, backend: str = "cuda", sched: str = "auto",
-                 weight_format: str = None, max_seq: int = MAX_SEQ_LEN):
+                 weight_format: str = None, max_seq: int = MAX_SEQ_LEN, trace: bool = False):
         if sched not in SCHED_MODES:
             raise ValueError(f"sched must be one of {list(SCHED_MODES)}")
         weight_format = weight_format or weights["format"]
@@ -218,10 +234,13 @@ class DpsDecoder:
                                    dtype=torch.float16, device="cuda")
         self.v_cache = torch.zeros_like(self.k_cache)
         self.last_launch = None   # (scheduler mode used, grid CTAs)
+        self.last_trace = None    # (first ticket, uint8 [n, 48] records) after a traced generate
         self._no_scale = torch.empty(0, dtype=torch.uint8, device="cuda")
 
+        if trace and backend != "cuda":
+            raise ValueError("tracing needs the CUDA backend")
         if backend == "cuda":
-            self.ext = _cuda_ext()
+            self.ext = _cuda_ext(trace)
             self.workspace = torch.empty(self.ext.workspace_bytes(), dtype=torch.uint8, device="cuda")
         elif backend == "cutedsl":
             sys.path.insert(0, os.path.join(HERE, "cutedsl"))
@@ -237,8 +256,11 @@ class DpsDecoder:
             return self.ext.info(WEIGHT_FORMATS[self.weight_format])
         return self.ext.info()
 
-    def generate_ids(self, prompt_ids, max_new: int, eos_token_id=None, start_pos: int = 0):
-        """Greedy-decode up to max_new tokens. Returns generated ids (EOS excluded)."""
+    def generate_ids(self, prompt_ids, max_new: int, eos_token_id=None, start_pos: int = 0, trace_steps=None):
+        """Greedy-decode up to max_new tokens. Returns generated ids (EOS excluded).
+
+        trace_steps=(first, last): with trace=True, record every tile of launch-relative
+        token steps first..last-1 (prefill steps are 0..n_prompt-2) into self.last_trace."""
         n_prompt = len(prompt_ids)
         eos = -1 if eos_token_id is None else int(eos_token_id)
         tokens = torch.empty(n_prompt + max_new, dtype=torch.int32, device="cuda")
@@ -246,12 +268,24 @@ class DpsDecoder:
         out = torch.full((max_new,), -1, dtype=torch.int32, device="cuda")
 
         if self.backend == "cuda":
+            trace, t0 = self._no_scale, 0
+            if trace_steps is not None:
+                info = self.info()
+                if not info["trace_build"]:
+                    raise RuntimeError("tracing needs DPS_TRACE=1 python setup.py build_ext --inplace")
+                n_pre, s0, s1 = n_prompt - 1, trace_steps[0], min(trace_steps[1], n_prompt - 1 + max_new)
+                t0 = first_ticket(s0, n_pre, info["tiles_per_step"], info["lm_tiles"])
+                t1 = first_ticket(s1, n_pre, info["tiles_per_step"], info["lm_tiles"])
+                trace = torch.zeros(max(t1 - t0, 0), TRACE_RECORD_BYTES, dtype=torch.uint8, device="cuda")
             lm = self.w["lm_head"]
             self.last_launch = self.ext.generate(
                 tokens, n_prompt, max_new, start_pos, eos, SCHED_MODES[self.sched],
                 WEIGHT_FORMATS[self.weight_format], self.w["embed"], self.layer_table, self.w["final_norm"],
                 lm.data, self._no_scale if lm.scale is None else lm.scale, lm.gscale,
-                self.w["cos"], self.w["sin"], self.k_cache, self.v_cache, self.workspace, out, self.attn_scale)
+                self.w["cos"], self.w["sin"], self.k_cache, self.v_cache, self.workspace, out, self.attn_scale,
+                trace, t0)
+            if trace_steps is not None:
+                self.last_trace = (t0, trace.cpu())
         else:
             self.last_launch = self.ext.generate(tokens, n_prompt, max_new, start_pos, eos,
                                                  SCHED_MODES[self.sched], out)

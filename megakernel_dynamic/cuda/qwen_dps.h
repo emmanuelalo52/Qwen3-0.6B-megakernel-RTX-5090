@@ -32,6 +32,20 @@ struct QwenDpsLayerWeights {
 };
 static_assert(sizeof(QwenDpsLayerWeights) == 200, "layer table layout changed");
 
+// Per-tile timing record, written by DPS_TRACE builds (qwen_dps_trace_C) for tickets
+// in [trace_first, trace_first + trace_count). Times are %globaltimer nanoseconds.
+struct QwenDpsTraceRecord {
+    unsigned long long claim;   // the scheduler warp took the ticket
+    unsigned long long start;   // the compute warps received it
+    unsigned long long ready;   // its dependency counters were satisfied
+    unsigned long long end;     // the tile finished, including its done-signal
+    unsigned int prep_ns;       // building the input vector (RMSNorm / copy from global)
+    unsigned int wwait_ns;      // waiting for weight stages from the TMA warp
+    unsigned int sm;            // %smid
+    unsigned int cta;           // blockIdx.x
+};
+static_assert(sizeof(QwenDpsTraceRecord) == 48, "trace record layout changed");
+
 struct QwenDpsLaunch {
     const void *embed;                      // [151936, 1024] fp16 (embedding lookup)
     const QwenDpsLayerWeights *layers;      // [28], device memory
@@ -47,9 +61,11 @@ struct QwenDpsLaunch {
     int   start_pos;                        // KV position of tokens[0]
     int   max_seq;
     int   eos_token;                        // -1 disables early stop
-    int   sched_mode;                       // 0 auto, 1 atomic, 2 CLC, 3 oneshot (test)
+    int   sched_mode;                       // 0 auto, 1 atomic, 2 CLC, 3 oneshot (test), 4 static
     int   weight_format;                    // QwenDpsWeightFormat
     float attn_scale;
+    QwenDpsTraceRecord *trace;              // nullptr = no tracing (needs a DPS_TRACE build)
+    int   trace_first, trace_count;         // ticket range to record
 };
 
 struct QwenDpsInfo {
@@ -65,10 +81,12 @@ struct QwenDpsInfo {
     int       tiles_per_step;      // without LM head
     int       lm_tiles;
     int       max_seq_supported;
+    int       trace_build;         // built with DPS_TRACE=1
+    int       phase_tiles[5];      // tiles per layer: QKV, attention, O-proj, gate/up, down
 };
 
 extern "C" size_t qwen_dps_workspace_bytes();
 extern "C" cudaError_t qwen_dps_info(int weight_format, QwenDpsInfo *info);
-// Returns the scheduler mode actually used (1 atomic, 2 CLC, 3 oneshot) and grid size.
+// Returns the scheduler mode actually used (1 atomic, 2 CLC, 3 oneshot, 4 static) and grid size.
 extern "C" cudaError_t qwen_dps_launch(const QwenDpsLaunch *args, cudaStream_t stream,
                                        int *used_mode, long long *grid_ctas);

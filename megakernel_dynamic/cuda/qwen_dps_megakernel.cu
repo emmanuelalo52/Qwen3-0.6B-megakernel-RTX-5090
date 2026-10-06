@@ -46,7 +46,7 @@ constexpr float EPS   = 1e-6f;
 #define DPS_RING_BYTES 196608  // weight ring: 192 KB of the 227 KB a B200 CTA may use
 #endif
 #ifndef DPS_SSTAGES
-#define DPS_SSTAGES 6          // tiles claimed ahead at fp16; scaled up for smaller fp8/fp4 tiles
+#define DPS_SSTAGES 1          // tiles a CTA may claim before starting them (see dps_scheduler.cuh)
 #endif
 constexpr int COMPUTE_WARPS   = 8;
 constexpr int COMPUTE_THREADS = COMPUTE_WARPS * 32;
@@ -56,28 +56,44 @@ constexpr int BLOCK_THREADS   = 320;
 constexpr int GROUP_BAR_ID    = 1;   // named barrier shared by the compute warps only
 
 // work decomposition (tiles per layer)
+// Every phase has at most 128 tiles, so on B200 (148 SMs) a phase is one round: with
+// an even hand-out each SM runs at most one tile of it. A tile is a few ring stages
+// ("chunks") of weights: a tile costs ~1.5 us of fixed latency (dependency check,
+// input prep, barriers, done-signal) but streams 32 KB in ~0.6 us, so fewer, bigger
+// tiles beat several rounds of small ones.
 // QKV rows are grouped per KV head (2 q heads + k + v = 512 rows) so attention
 // for head h can start as soon as its own group is done.
-constexpr int QKV_ROWS        = 16;
+constexpr int QKV_CHUNK_ROWS  = 16;
+constexpr int QKV_ROWS        = 32;                        // 2 chunks
 constexpr int GROUP_ROWS      = 2 * HD + HD + HD;
-constexpr int QKV_TILES_GROUP = GROUP_ROWS / QKV_ROWS;     // 32
-constexpr int T_QKV           = NKV * QKV_TILES_GROUP;     // 256
+constexpr int QKV_TILES_GROUP = GROUP_ROWS / QKV_ROWS;     // 16
+constexpr int T_QKV           = NKV * QKV_TILES_GROUP;     // 128
 constexpr int ATTN_CHUNK      = 256;                       // KV positions per split
 constexpr int ATTN_SPLITS     = 8;                         // => max_seq <= 2048
 constexpr int T_ATTN          = NKV * ATTN_SPLITS;         // 64
-constexpr int O_ROWS          = 8;
+constexpr int O_ROWS          = 8;                         // 1 chunk
 constexpr int T_O             = H / O_ROWS;                // 128
-constexpr int GU_ROWS         = 8;
-constexpr int T_GU            = I / GU_ROWS;               // 384
-constexpr int D_ROWS          = 4;
-constexpr int T_D             = H / D_ROWS;                // 256
+constexpr int GU_CHUNK_ROWS   = 8;                         // 8 gate + 8 up rows per chunk
+constexpr int GU_ROWS         = 24;                        // 3 chunks
+constexpr int T_GU            = I / GU_ROWS;               // 128
+constexpr int D_CHUNK_ROWS    = 4;
+constexpr int D_ROWS          = 8;                         // 2 chunks
+constexpr int T_D             = H / D_ROWS;                // 128
 constexpr int T_LAYER         = T_QKV + T_ATTN + T_O + T_GU + T_D;
 constexpr int T_STEP          = NL * T_LAYER;
-constexpr int LM_ROWS         = 64;
+constexpr int LM_ROWS         = 128;
 constexpr int LM_CHUNK_ROWS   = 16;
-constexpr int LM_CHUNKS       = LM_ROWS / LM_CHUNK_ROWS;
-constexpr int T_LM            = VOCAB / LM_ROWS;           // 2374
+constexpr int LM_CHUNKS       = LM_ROWS / LM_CHUNK_ROWS;   // 8
+constexpr int T_LM            = VOCAB / LM_ROWS;           // 1187
+constexpr int QKV_CHUNKS      = QKV_ROWS / QKV_CHUNK_ROWS;
+constexpr int GU_CHUNKS       = GU_ROWS / GU_CHUNK_ROWS;
+constexpr int D_CHUNKS        = D_ROWS / D_CHUNK_ROWS;
 static_assert(VOCAB % LM_ROWS == 0, "vocab must split evenly into LM tiles");
+static_assert(HD % QKV_ROWS == 0, "a QKV tile must not straddle q/k/v heads");
+static_assert(QKV_ROWS % QKV_CHUNK_ROWS == 0 && QKV_CHUNK_ROWS % COMPUTE_WARPS == 0, "QKV chunking");
+static_assert(GU_CHUNK_ROWS == COMPUTE_WARPS && GU_ROWS % GU_CHUNK_ROWS == 0, "gate/up: one row pair per warp");
+static_assert(D_CHUNK_ROWS * 2 == COMPUTE_WARPS && D_ROWS % D_CHUNK_ROWS == 0, "down: two warps per row");
+static_assert(O_ROWS == COMPUTE_WARPS, "O-proj: one row per warp");
 
 // weight formats
 // GROUP = weights one lane handles per step (one 16-byte or 8-byte load);
@@ -100,15 +116,14 @@ constexpr int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi 
 
 // One ring stage holds the largest weight chunk (weights followed by their scales).
 template <int F> constexpr int stage_bytes() {
-    const int b = cmax(cmax(tile_bytes<F>(QKV_ROWS, H), tile_bytes<F>(O_ROWS, QS)),
-                       cmax(cmax(tile_bytes<F>(2 * GU_ROWS, H), tile_bytes<F>(D_ROWS, I)),
+    const int b = cmax(cmax(tile_bytes<F>(QKV_CHUNK_ROWS, H), tile_bytes<F>(O_ROWS, QS)),
+                       cmax(cmax(tile_bytes<F>(2 * GU_CHUNK_ROWS, H), tile_bytes<F>(D_CHUNK_ROWS, I)),
                             tile_bytes<F>(LM_CHUNK_ROWS, H)));
     return (b + 127) / 128 * 128;
 }
 template <int F> constexpr int weight_stages() { return clampi(DPS_RING_BYTES / stage_bytes<F>(), 1, 16); }
-template <int F> constexpr int sched_stages() {
-    return clampi(DPS_SSTAGES * 32768 / stage_bytes<F>(), DPS_SSTAGES, 12);
-}
+// Same claim-ahead for every format: claiming deeper only spreads tiles unevenly.
+template <int F> constexpr int sched_stages() { return clampi(DPS_SSTAGES, 1, 12); }
 
 enum Phase { PH_QKV = 0, PH_ATTN, PH_OPROJ, PH_GATEUP, PH_DOWN, PH_LM };
 
@@ -144,6 +159,8 @@ struct Params {
     int   total_tiles;
     int   start_pos, max_seq, eos_token, sched_mode;
     float attn_scale;
+    QwenDpsTraceRecord *trace;   // DPS_TRACE builds only
+    int   trace_first, trace_count;
 };
 
 // Shared memory that does not depend on the weight format.
@@ -152,12 +169,13 @@ struct alignas(16) SmemCommon {
     float    qs[2][HD];                   // roped queries of the 2 heads sharing a KV head
     float    wm[COMPUTE_WARPS][2], wl[COMPUTE_WARPS][2];
     float    wacc[COMPUTE_WARPS][2][HD];
-    float    red[COMPUTE_WARPS];
+    float    red[D_CHUNKS * COMPUTE_WARPS];   // block sums; per-chunk partials of a down tile
     float    best_v[COMPUTE_WARPS];
     int      best_i[COMPUTE_WARPS];
     int      x_tag;                       // which input currently sits in xs
     int      flag;
     unsigned dep_seen[C_NUM];             // last counter values observed (thread 0)
+    unsigned tr_prep, tr_wwait;           // DPS_TRACE: ns spent in input prep / weight waits this tile
 };
 
 template <int F>
@@ -176,6 +194,20 @@ struct Tile { int step, layer, phase, idx; };
 
 // small helpers
 __device__ __forceinline__ void group_bar() { dps::named_bar_sync(GROUP_BAR_ID, COMPUTE_THREADS); }
+
+// DPS_TRACE: adds the scope's duration (as seen by compute thread 0) to a per-tile counter.
+struct TraceSpan {
+#if DPS_TRACE
+    unsigned *acc;
+    uint64_t  t0;
+    __device__ explicit TraceSpan(unsigned &a) : acc(&a), t0(dps::globaltimer_ns()) {}
+    __device__ ~TraceSpan() {
+        if (threadIdx.x == 0) *acc += static_cast<unsigned>(dps::globaltimer_ns() - t0);
+    }
+#else
+    __device__ explicit TraceSpan(unsigned &) {}
+#endif
+};
 
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
@@ -344,11 +376,13 @@ __device__ __forceinline__ Tile decode_tile(int t, const Params &p) {
 }
 
 // QKV tile -> (q/k/v, first row). Rows of one tile never straddle q/k/v.
+// A group's tiles cover its 2 q heads, then its k head, then its v head.
 __device__ __forceinline__ void qkv_rows(const Tile &T, int &which, int &row0) {
+    constexpr int TQ = 2 * HD / QKV_ROWS, TK = HD / QKV_ROWS;
     const int g = T.idx / QKV_TILES_GROUP, j = T.idx % QKV_TILES_GROUP;
-    if (j < 16)      { which = 0; row0 = g * 2 * HD + j * QKV_ROWS; }
-    else if (j < 24) { which = 1; row0 = g * HD + (j - 16) * QKV_ROWS; }
-    else             { which = 2; row0 = g * HD + (j - 24) * QKV_ROWS; }
+    if (j < TQ)           { which = 0; row0 = g * 2 * HD + j * QKV_ROWS; }
+    else if (j < TQ + TK) { which = 1; row0 = g * HD + (j - TQ) * QKV_ROWS; }
+    else                  { which = 2; row0 = g * HD + (j - TQ - TK) * QKV_ROWS; }
 }
 
 __device__ __forceinline__ const QwenDpsMatrix &qkv_matrix(const QwenDpsLayerWeights &lw, int which) {
@@ -368,7 +402,14 @@ struct Chunk {
 };
 
 __device__ __forceinline__ int num_chunks(const Tile &T) {
-    return T.phase == PH_ATTN ? 0 : (T.phase == PH_LM ? LM_CHUNKS : 1);
+    switch (T.phase) {
+    case PH_QKV:    return QKV_CHUNKS;
+    case PH_ATTN:   return 0;
+    case PH_OPROJ:  return 1;
+    case PH_GATEUP: return GU_CHUNKS;
+    case PH_DOWN:   return D_CHUNKS;
+    default:        return LM_CHUNKS;
+    }
 }
 
 // rows [row0, row0 + rows) of m: weights at stage offset dst_w, scales at dst_s.
@@ -394,7 +435,8 @@ __device__ Chunk tile_chunk(const Tile &T, int c, const Params &p) {
     case PH_QKV: {
         int which, row0;
         qkv_rows(T, which, row0);
-        add_rows<F>(ch, qkv_matrix(lw, which), H, row0, QKV_ROWS, 0, QKV_ROWS * row_bytes<F>(H));
+        add_rows<F>(ch, qkv_matrix(lw, which), H, row0 + c * QKV_CHUNK_ROWS, QKV_CHUNK_ROWS, 0,
+                    QKV_CHUNK_ROWS * row_bytes<F>(H));
         break;
     }
     case PH_OPROJ:
@@ -403,12 +445,15 @@ __device__ Chunk tile_chunk(const Tile &T, int c, const Params &p) {
     case PH_GATEUP: {
         // [gate w | up w | gate scales | up scales]: rows 0..7 gate, 8..15 up
         constexpr int rb = row_bytes<F>(H), sb = scale_bytes<F>(H);
-        add_rows<F>(ch, lw.gate, H, T.idx * GU_ROWS, GU_ROWS, 0, 2 * GU_ROWS * rb);
-        add_rows<F>(ch, lw.up, H, T.idx * GU_ROWS, GU_ROWS, GU_ROWS * rb, 2 * GU_ROWS * rb + GU_ROWS * sb);
+        const int row0 = T.idx * GU_ROWS + c * GU_CHUNK_ROWS;
+        add_rows<F>(ch, lw.gate, H, row0, GU_CHUNK_ROWS, 0, 2 * GU_CHUNK_ROWS * rb);
+        add_rows<F>(ch, lw.up, H, row0, GU_CHUNK_ROWS, GU_CHUNK_ROWS * rb,
+                    2 * GU_CHUNK_ROWS * rb + GU_CHUNK_ROWS * sb);
         break;
     }
     case PH_DOWN:
-        add_rows<F>(ch, lw.down, I, T.idx * D_ROWS, D_ROWS, 0, D_ROWS * row_bytes<F>(I));
+        add_rows<F>(ch, lw.down, I, T.idx * D_ROWS + c * D_CHUNK_ROWS, D_CHUNK_ROWS, 0,
+                    D_CHUNK_ROWS * row_bytes<F>(I));
         break;
     }
     return ch;
@@ -452,6 +497,7 @@ __device__ void wait_dependencies(SmemCommon &S, const Params &p, const Tile &T)
 // input preparation (all compute threads, called right after a group_bar)
 // HF Qwen3RMSNorm in fp16: y = half(x * rsqrt(mean(x^2) + eps)); out = half(w * y).
 __device__ void prep_rmsnorm(SmemCommon &S, const half *src, const half *w) {
+    TraceSpan span(S.tr_prep);
     const int tid = threadIdx.x;   // 256 threads x 4 elements
     const uint2 raw = __ldcg(reinterpret_cast<const uint2 *>(src) + tid);
     const half2 *xh = reinterpret_cast<const half2 *>(&raw);
@@ -470,6 +516,7 @@ __device__ void prep_rmsnorm(SmemCommon &S, const half *src, const half *w) {
 }
 
 __device__ void prep_copy(SmemCommon &S, const half *src, int n) {
+    TraceSpan span(S.tr_prep);
     const uint4 *s = reinterpret_cast<const uint4 *>(src);
     uint4 *d = reinterpret_cast<uint4 *>(S.xs);
     for (int i = threadIdx.x; i < n / 8; i += COMPUTE_THREADS) d[i] = __ldcg(s + i);
@@ -486,6 +533,7 @@ __device__ __forceinline__ const half *layer_input(const Params &p, const Tile &
 // weight ring (consumer side)
 template <int F>
 __device__ __forceinline__ const uint8_t *stage_wait(Smem<F> &S, RingState<F> &ws) {
+    TraceSpan span(S.c.tr_wwait);
     dps::bar_wait(&S.w_full[ws.index], ws.phase);
     return S.wbuf[ws.index];
 }
@@ -513,14 +561,17 @@ __device__ void tile_qkv(Smem<F> &S, const Params &p, const Tile &T, RingState<F
 
     uint4 x[NJ * XU<F>];
     load_x<F, NJ>(S.c, 0, x);
-    const uint8_t *st = stage_wait(S, ws);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    #pragma unroll
-    for (int r = warp; r < QKV_ROWS; r += COMPUTE_WARPS) {
-        const float d = dot_row<F, NJ>(st + r * rb, st + QKV_ROWS * rb + r * sb, 0, x) * gs;
-        if (lane == 0) out[r] = __float2half(d);
+    #pragma unroll 1
+    for (int c = 0; c < QKV_CHUNKS; ++c) {
+        const uint8_t *st = stage_wait(S, ws);
+        #pragma unroll
+        for (int r = warp; r < QKV_CHUNK_ROWS; r += COMPUTE_WARPS) {
+            const float d = dot_row<F, NJ>(st + r * rb, st + QKV_CHUNK_ROWS * rb + r * sb, 0, x) * gs;
+            if (lane == 0) out[c * QKV_CHUNK_ROWS + r] = __float2half(d);
+        }
+        stage_release(S, ws);
     }
-    stage_release(S, ws);
     group_bar();
     if (threadIdx.x == 0) signal_done(p, C_QKV + T.idx / QKV_TILES_GROUP);
 }
@@ -701,17 +752,20 @@ __device__ void tile_gateup(Smem<F> &S, const Params &p, const Tile &T, RingStat
     }
     uint4 x[NJ * XU<F>];
     load_x<F, NJ>(S.c, 0, x);
-    const uint8_t *st = stage_wait(S, ws);
-    const uint8_t *sc = st + 2 * GU_ROWS * rb;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const float g = h2f_round(dot_row<F, NJ>(st + warp * rb, sc + warp * sb, 0, x) * lw.gate.gscale);
-    const float u = h2f_round(dot_row<F, NJ>(st + (GU_ROWS + warp) * rb, sc + (GU_ROWS + warp) * sb, 0, x) *
-                              lw.up.gscale);
-    if (lane == 0) {
-        const float silu = h2f_round(g / (1.f + expf(-g)));
-        p.act[T.idx * GU_ROWS + warp] = __float2half(silu * u);
+    #pragma unroll 1
+    for (int c = 0; c < GU_CHUNKS; ++c) {
+        const uint8_t *st = stage_wait(S, ws);
+        const uint8_t *sc = st + 2 * GU_CHUNK_ROWS * rb;
+        const float g = h2f_round(dot_row<F, NJ>(st + warp * rb, sc + warp * sb, 0, x) * lw.gate.gscale);
+        const float u = h2f_round(dot_row<F, NJ>(st + (GU_CHUNK_ROWS + warp) * rb,
+                                                 sc + (GU_CHUNK_ROWS + warp) * sb, 0, x) * lw.up.gscale);
+        stage_release(S, ws);
+        if (lane == 0) {
+            const float silu = h2f_round(g / (1.f + expf(-g)));
+            p.act[T.idx * GU_ROWS + c * GU_CHUNK_ROWS + warp] = __float2half(silu * u);
+        }
     }
-    stage_release(S, ws);
     group_bar();
     if (threadIdx.x == 0) signal_done(p, C_GATEUP);
 }
@@ -729,15 +783,18 @@ __device__ void tile_down(Smem<F> &S, const Params &p, const Tile &T, RingState<
     const int r = warp >> 1, khalf = warp & 1;
     uint4 x[NJ * XU<F>];
     load_x<F, NJ>(S.c, khalf * (I / 2), x);
-    const uint8_t *st = stage_wait(S, ws);
-    const float part = dot_row<F, NJ>(st + r * rb, st + D_ROWS * rb + r * sb, khalf * NJ * 32, x);
-    stage_release(S, ws);
-    if (lane == 0) S.c.red[warp] = part;
+    #pragma unroll 1
+    for (int c = 0; c < D_CHUNKS; ++c) {
+        const uint8_t *st = stage_wait(S, ws);
+        const float part = dot_row<F, NJ>(st + r * rb, st + D_CHUNK_ROWS * rb + r * sb, khalf * NJ * 32, x);
+        stage_release(S, ws);
+        if (lane == 0) S.c.red[c * COMPUTE_WARPS + warp] = part;
+    }
     group_bar();
-    if (threadIdx.x < D_ROWS) {
+    if (threadIdx.x < D_ROWS) {   // thread t finishes row t of the tile: chunk t / 4, row t % 4 in it
+        const float *red = S.c.red + (threadIdx.x / D_CHUNK_ROWS) * COMPUTE_WARPS + 2 * (threadIdx.x % D_CHUNK_ROWS);
         const int row = T.idx * D_ROWS + threadIdx.x;
-        const float d = h2f_round((S.c.red[2 * threadIdx.x] + S.c.red[2 * threadIdx.x + 1]) *
-                                  p.layers[T.layer].down.gscale);
+        const float d = h2f_round((red[0] + red[1]) * p.layers[T.layer].down.gscale);
         p.hidden[row] = __float2half(ldcg_h(p.h1 + row) + d);
     }
     group_bar();
@@ -758,6 +815,7 @@ __device__ void tile_lm(Smem<F> &S, const Params &p, const Tile &T, RingState<F>
     load_x<F, NJ>(C, 0, x);
     float bv = -INFINITY;
     int bi = 0x7fffffff;
+    #pragma unroll 1
     for (int c = 0; c < LM_CHUNKS; ++c) {
         const uint8_t *st = stage_wait(S, ws);
         #pragma unroll
@@ -815,6 +873,25 @@ __device__ void tile_lm(Smem<F> &S, const Params &p, const Tile &T, RingState<F>
     }
 }
 
+// DPS_TRACE: compute thread 0 writes one record per tile in the traced ticket range.
+__device__ void trace_tile(const Params &p, const SmemCommon &S, const dps::WorkTileInfo &w,
+                           uint64_t start, uint64_t ready) {
+#if DPS_TRACE
+    const unsigned i = static_cast<unsigned>(w.tile_idx - p.trace_first);
+    if (p.trace == nullptr || i >= static_cast<unsigned>(p.trace_count)) return;
+    QwenDpsTraceRecord r;
+    r.claim    = w.claim_ns;
+    r.start    = start;
+    r.ready    = ready;
+    r.end      = dps::globaltimer_ns();
+    r.prep_ns  = S.tr_prep;
+    r.wwait_ns = S.tr_wwait;
+    r.sm       = dps::smid();
+    r.cta      = blockIdx.x;
+    p.trace[i] = r;
+#endif
+}
+
 // warp roles
 template <int F>
 __device__ void compute_loop(Smem<F> &S, const Params &p, Scheduler<F> &sched) {
@@ -823,9 +900,17 @@ __device__ void compute_loop(Smem<F> &S, const Params &p, Scheduler<F> &sched) {
     for (;;) {
         const dps::WorkTileInfo work = sched.get_current_work(cons);
         if (!work.is_valid_tile) break;
+        uint64_t t_start = 0, t_ready = 0;
+#if DPS_TRACE
+        t_start = dps::globaltimer_ns();
+        if (threadIdx.x == 0) S.c.tr_prep = S.c.tr_wwait = 0u;
+#endif
         const Tile T = decode_tile(work.tile_idx, p);
         if (threadIdx.x == 0) wait_dependencies(S.c, p, T);
         group_bar();
+#if DPS_TRACE
+        t_ready = dps::globaltimer_ns();
+#endif
         switch (T.phase) {
         case PH_QKV:    tile_qkv<F>(S, p, T, ws); break;
         case PH_ATTN:   tile_attention(S.c, p, T); break;
@@ -834,6 +919,7 @@ __device__ void compute_loop(Smem<F> &S, const Params &p, Scheduler<F> &sched) {
         case PH_DOWN:   tile_down<F>(S, p, T, ws); break;
         default:        tile_lm<F>(S, p, T, ws); break;
         }
+        if (threadIdx.x == 0) trace_tile(p, S.c, work, t_start, t_ready);
     }
 }
 
@@ -924,7 +1010,7 @@ constexpr WorkspaceLayout workspace_layout() {
     return L;
 }
 
-struct DeviceCaps { int device = -1, num_sms = 0, cc_major = 0, clc = 0, real_mbar = 0, ctas_per_sm = 0; };
+struct DeviceCaps { int device = -1, num_sms = 0, cc_major = 0, clc = 0, real_mbar = 0, ctas_per_sm = 0, coop = 0; };
 
 template <int F>
 static cudaError_t query_caps(DeviceCaps &caps) {
@@ -937,6 +1023,7 @@ static cudaError_t query_caps(DeviceCaps &caps) {
     caps.device = dev;
     cudaDeviceGetAttribute(&caps.num_sms, cudaDevAttrMultiProcessorCount, dev);
     cudaDeviceGetAttribute(&caps.cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&caps.coop, cudaDevAttrCooperativeLaunch, dev);
     err = cudaFuncSetAttribute(qwen_dps_kernel<F>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(Smem<F>));
     if (err != cudaSuccess) return err;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&caps.ctas_per_sm, qwen_dps_kernel<F>, BLOCK_THREADS,
@@ -972,6 +1059,9 @@ static cudaError_t info_impl(QwenDpsInfo *info) {
     info->tiles_per_step    = T_STEP;
     info->lm_tiles          = T_LM;
     info->max_seq_supported = ATTN_CHUNK * ATTN_SPLITS;
+    info->trace_build       = DPS_TRACE;
+    const int phase_tiles[5] = {T_QKV, T_ATTN, T_O, T_GU, T_D};
+    for (int i = 0; i < 5; ++i) info->phase_tiles[i] = phase_tiles[i];
     return cudaSuccess;
 }
 
@@ -987,16 +1077,20 @@ static cudaError_t launch_impl(const QwenDpsLaunch *a, cudaStream_t stream, int 
     if (err != cudaSuccess) return err;
     if (caps.ctas_per_sm < 1) return cudaErrorInvalidConfiguration;
 
+    if (a->trace && (!DPS_TRACE || a->trace_first < 0 || a->trace_count < 0)) return cudaErrorInvalidValue;
+
     int mode = a->sched_mode;
     if (mode == dps::kSchedAuto) mode = caps.clc ? dps::kSchedClc : dps::kSchedAtomic;
     if (mode == dps::kSchedClc && !caps.clc) return cudaErrorNotSupported;
+    if (mode == dps::kSchedStatic && !caps.coop) return cudaErrorNotSupported;
 
     const long long n_pre = a->n_prompt - 1;
     const long long total = n_pre * T_STEP + (long long)a->max_new * (T_STEP + T_LM);
     if (total > 0x7fffffffLL) return cudaErrorInvalidValue;
-    // CLC: one CTA per tile, like a non-persistent launch; running CTAs steal the
-    // rest. Atomic: one persistent CTA per SM slot pulls tickets.
-    const long long grid = (mode == dps::kSchedAtomic) ? (long long)caps.num_sms * caps.ctas_per_sm : total;
+    // CLC (and oneshot): one CTA per tile, like a non-persistent launch; running CTAs
+    // steal the rest. Atomic and static: one persistent CTA per SM slot.
+    const bool persistent = mode == dps::kSchedAtomic || mode == dps::kSchedStatic;
+    const long long grid = persistent ? (long long)caps.num_sms * caps.ctas_per_sm : total;
 
     const WorkspaceLayout L = workspace_layout();
     uint8_t *ws = static_cast<uint8_t *>(a->workspace);
@@ -1028,10 +1122,20 @@ static cudaError_t launch_impl(const QwenDpsLaunch *a, cudaStream_t stream, int 
     p.eos_token   = a->eos_token;
     p.sched_mode  = mode;
     p.attn_scale  = a->attn_scale;
+    p.trace       = a->trace;
+    p.trace_first = a->trace_first;
+    p.trace_count = a->trace_count;
 
     if ((err = cudaMemsetAsync(p.sync, 0, sizeof(unsigned) * C_NUM * CSTRIDE, stream)) != cudaSuccess) return err;
-    qwen_dps_kernel<F><<<(unsigned)grid, BLOCK_THREADS, sizeof(Smem<F>), stream>>>(p);
-    err = cudaGetLastError();
+    if (mode == dps::kSchedStatic) {
+        // Static tickets are only deadlock-free if every CTA is resident at once.
+        void *args[] = {&p};
+        err = cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(qwen_dps_kernel<F>), dim3((unsigned)grid),
+                                          dim3(BLOCK_THREADS), args, sizeof(Smem<F>), stream);
+    } else {
+        qwen_dps_kernel<F><<<(unsigned)grid, BLOCK_THREADS, sizeof(Smem<F>), stream>>>(p);
+        err = cudaGetLastError();
+    }
     if (used_mode) *used_mode = mode;
     if (grid_ctas) *grid_ctas = grid;
     return err;

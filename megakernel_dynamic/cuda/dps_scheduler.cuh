@@ -25,6 +25,19 @@
 // SchedMode::Atomic drops CLC and launches one persistent CTA per SM that pulls
 // tickets until they run out (the software dynamic persistent scheduler). It is
 // the fallback for pre-Blackwell GPUs and a baseline to compare against.
+//
+// SchedMode::Static is the static persistent scheduler: one co-resident CTA per SM
+// slot (cooperative launch), and CTA c runs tickets c, c + G, c + 2G, ... (G = grid
+// size) with no atomics. Deadlock-free for the same reason as the ordered tickets:
+// the lowest unfinished ticket belongs to a resident CTA whose earlier tickets, and
+// so its inputs, are all done. When no phase has more tiles than the grid has CTAs,
+// each CTA gets at most one tile of every phase.
+//
+// Claim-ahead. The producer claims a ticket only once a ring slot is free for it,
+// so a CTA holds at most Stages tickets it has not started. Claiming further ahead
+// lets the TMA warp prefetch more weights, but in the dynamic modes it also hands
+// out tiles before anyone knows which will be ready first: on B200 the busiest SM
+// ended up with 2-3x its share of each phase (see README, "B200 benchmarks").
 #pragma once
 #include "dps_arch.cuh"
 
@@ -33,7 +46,7 @@ namespace dps {
 // kSchedOneShot is a test mode: grid = tiles, every CTA runs exactly one ticket
 // and exits. It reproduces CLC's launch pattern (CTAs that are not resident hold
 // no work) on GPUs without CLC, to check the ordering argument above.
-enum SchedMode : int { kSchedAuto = 0, kSchedAtomic = 1, kSchedClc = 2, kSchedOneShot = 3 };
+enum SchedMode : int { kSchedAuto = 0, kSchedAtomic = 1, kSchedClc = 2, kSchedOneShot = 3, kSchedStatic = 4 };
 
 // try_cancel queries issued back-to-back while draining the grid after an early stop.
 constexpr int kDrainBatch = 16;
@@ -41,6 +54,9 @@ constexpr int kDrainBatch = 16;
 struct WorkTileInfo {
     int  tile_idx;
     bool is_valid_tile;
+#if DPS_TRACE
+    uint64_t claim_ns = 0;       // when the scheduler warp took the ticket
+#endif
 };
 
 // Producer/consumer position in a ring of barriers (cutlass.pipeline.PipelineState).
@@ -66,13 +82,16 @@ struct SchedulerStorage {
     Barrier clc_bar;             // completes when try_cancel responses land
     int4    clc_resp[kDrainBatch];
     int     work[Stages];        // ticket, or -1 = no more work
+#if DPS_TRACE
+    uint64_t claim_ns[Stages];
+#endif
 };
 
 struct SchedulerParams {
     unsigned       *ticket;      // global ordered-ticket counter (zeroed per launch)
     const unsigned *stop_flag;   // non-zero: stop handing out work (EOS reached)
     int             total_tiles;
-    int             mode;        // kSchedAtomic or kSchedClc
+    int             mode;        // kSchedAtomic, kSchedClc, kSchedOneShot or kSchedStatic
 };
 
 template <int Stages>
@@ -80,7 +99,7 @@ class DynamicPersistentTileScheduler {
   public:
     __device__ DynamicPersistentTileScheduler(const SchedulerParams &params,
                                               SchedulerStorage<Stages> *storage)
-        : params_(params), st_(storage) {}
+        : params_(params), st_(storage), next_static_(static_cast<int>(blockIdx.x)) {}
 
     // One thread, before the CTA-wide barrier that publishes the storage.
     __device__ static void init_storage(SchedulerStorage<Stages> *st, int num_consumer_warps) {
@@ -91,16 +110,21 @@ class DynamicPersistentTileScheduler {
         bar_init(&st->clc_bar, 1);
     }
 
-    // producer: scheduler warp, single thread
+    // producer: scheduler warp, single thread. A ticket is claimed only after a slot
+    // is free for it (producer_acquire first), so at most Stages are claimed ahead.
     __device__ void run_producer() {
         PipelineState<Stages> prod = make_producer_state<Stages>();
+        bar_wait(&st_->empty[prod.index], prod.phase);                // producer_acquire
         WorkTileInfo work = initial_work_tile_info();
         for (;;) {
-            bar_wait(&st_->empty[prod.index], prod.phase);            // producer_acquire
             st_->work[prod.index] = work.is_valid_tile ? work.tile_idx : -1;
+#if DPS_TRACE
+            st_->claim_ns[prod.index] = work.claim_ns;
+#endif
             bar_arrive(&st_->full[prod.index]);                        // producer_commit
             prod.advance();
             if (!work.is_valid_tile) break;
+            bar_wait(&st_->empty[prod.index], prod.phase);            // producer_acquire
             work = advance_to_next_work();
         }
     }
@@ -109,11 +133,16 @@ class DynamicPersistentTileScheduler {
     // consumer_wait + get_current_work + consumer_release.
     __device__ WorkTileInfo get_current_work(PipelineState<Stages> &cons) {
         bar_wait(&st_->full[cons.index], cons.phase);
-        const int t = *reinterpret_cast<volatile int *>(&st_->work[cons.index]);
+        WorkTileInfo w;
+        w.tile_idx      = *reinterpret_cast<volatile int *>(&st_->work[cons.index]);
+        w.is_valid_tile = w.tile_idx >= 0;
+#if DPS_TRACE
+        w.claim_ns = *reinterpret_cast<volatile uint64_t *>(&st_->claim_ns[cons.index]);
+#endif
         __syncwarp();
         if ((threadIdx.x & 31) == 0) bar_arrive(&st_->empty[cons.index]);
         cons.advance();
-        return {t, t >= 0};
+        return w;
     }
 
   private:
@@ -139,9 +168,20 @@ class DynamicPersistentTileScheduler {
     }
 
     __device__ WorkTileInfo take_ticket() {
-        if (stop_requested()) return {-1, false};
-        const int t = static_cast<int>(atomicAdd(params_.ticket, 1u));
-        return {t, t < params_.total_tiles};
+        WorkTileInfo w;
+        if (stop_requested()) {
+            w.tile_idx = -1;
+        } else if (params_.mode == kSchedStatic) {
+            w.tile_idx = next_static_;
+            next_static_ += static_cast<int>(gridDim.x);
+        } else {
+            w.tile_idx = static_cast<int>(atomicAdd(params_.ticket, 1u));
+        }
+        w.is_valid_tile = w.tile_idx >= 0 && w.tile_idx < params_.total_tiles;
+#if DPS_TRACE
+        w.claim_ns = globaltimer_ns();
+#endif
+        return w;
     }
 
     __device__ bool stop_requested() const { return ld_relaxed(params_.stop_flag) != 0u; }
@@ -167,6 +207,7 @@ class DynamicPersistentTileScheduler {
     SchedulerParams           params_;
     SchedulerStorage<Stages> *st_;
     uint32_t                  clc_phase_ = 0;
+    int                       next_static_;   // kSchedStatic: this CTA's next ticket
 };
 
 }  // namespace dps

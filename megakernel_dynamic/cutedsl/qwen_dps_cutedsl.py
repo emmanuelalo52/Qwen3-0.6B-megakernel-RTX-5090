@@ -46,7 +46,7 @@ EPS = 1e-6
 
 # CTA layout (matches the CUDA build for B200)
 RING_BYTES = 196608         # DPS_RING_BYTES
-SSTAGES_BASE = 6            # DPS_SSTAGES
+SSTAGES_BASE = 1            # DPS_SSTAGES: tiles a CTA may claim before starting them
 COMPUTE_WARPS = 8
 COMPUTE_THREADS = COMPUTE_WARPS * 32
 LOAD_WARP, SCHED_WARP = 8, 9
@@ -107,7 +107,8 @@ def weight_stages(f):
 
 
 def sched_stages(f):
-    return min(max(SSTAGES_BASE * 32768 // stage_bytes(f), SSTAGES_BASE), 12)
+    # Same claim-ahead for every format: on B200, claiming deeper spread tiles unevenly.
+    return min(max(SSTAGES_BASE, 1), 12)
 
 # global counters (int32, 32 bytes apart)
 C_TICKET = 0
@@ -275,11 +276,16 @@ def mat_gscale(c, layer, m):
 
 
 def fetch_work(c, work_pipe, cons):
-    """consumer_wait + read ticket + consumer_release (cf. get_current_work)."""
+    """consumer_wait + read ticket + consumer_release (cf. get_current_work).
+
+    The caller advances `cons` itself, in the loop body: the DSL carries a value into
+    the next iteration of a dynamic loop only if the body assigns it or calls a method
+    on it, and an object mutated inside a helper is neither. With the advance in here,
+    every iteration re-read the same ring slot, which duplicated and dropped tickets
+    and let the load and compute warps disagree on tiles until the kernel deadlocked."""
     work_pipe.consumer_wait(cons)
     t = c.work[cons.index]
     work_pipe.consumer_release(cons)
-    cons.advance()
     return t
 
 
@@ -481,12 +487,14 @@ class QwenDpsKernel:
     @cute.jit
     def sched_loop(self, c, work_pipe, tile_sched):
         prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.SST)
+        # A ticket is claimed only once a ring slot is free for it (producer_acquire
+        # first), so a CTA holds at most SST tickets it has not started.
+        work_pipe.producer_acquire(prod)
         # initial_work_tile_info: the CTA's own launch is its first permission.
         t = self.take_ticket(c)
         clc_phase = Int32(0)
         keep = Boolean(True)
         while keep:
-            work_pipe.producer_acquire(prod)
             if c.lane == 0:
                 c.work[prod.index] = t
             work_pipe.producer_commit(prod)
@@ -494,6 +502,7 @@ class QwenDpsKernel:
             if t < 0:
                 keep = Boolean(False)
             else:
+                work_pipe.producer_acquire(prod)
                 t = Int32(-1)
                 stop = cute.arch.shuffle_sync(
                     cute.arch.load(c.sync + C_EOS * CSTRIDE, Int32, sem="relaxed", scope="gpu"), 0)
@@ -634,6 +643,7 @@ class QwenDpsKernel:
         policy = l2_evict_first_policy()
         wbuf_addr = c.wbuf.iterator.toint()
         t = fetch_work(c, work_pipe, cons)
+        cons.advance()
         while t >= 0:
             step, layer, phase, idx = self.decode_tile(c, t)
             nch = Int32(1)
@@ -657,6 +667,7 @@ class QwenDpsKernel:
                         bulk_g2s(dst + d3, s3, n3, full.toint(), policy)
                 ws_idx, ws_ph = ring_next(ws_idx, ws_ph, 1, self.W)
             t = fetch_work(c, work_pipe, cons)
+            cons.advance()
 
     # compute warps
     @cute.jit
@@ -1140,6 +1151,7 @@ class QwenDpsKernel:
         ws_idx = Int32(0)
         ws_ph = Int32(0)
         t = fetch_work(c, work_pipe, cons)
+        cons.advance()
         while t >= 0:
             step, layer, phase, idx = self.decode_tile(c, t)
             if c.tid == 0:
@@ -1162,6 +1174,7 @@ class QwenDpsKernel:
                 nch = Int32(LM_CHUNKS)
             ws_idx, ws_ph = ring_next(ws_idx, ws_ph, nch, self.W)
             t = fetch_work(c, work_pipe, cons)
+            cons.advance()
 
 
 # host wrapper
@@ -1187,7 +1200,8 @@ class CuteDslMegakernel:
         return dict(num_sms=self.num_sms, clc_supported=self.clc_supported, real_mbarrier=True,
                     block_threads=BLOCK_THREADS, stage_bytes=stage_bytes(self.fmt),
                     weight_stages=weight_stages(self.fmt), sched_stages=sched_stages(self.fmt), ctas_per_sm=1,
-                    tiles_per_step=T_STEP, lm_tiles=T_LM, max_seq_supported=MAX_SEQ_SUPPORTED)
+                    tiles_per_step=T_STEP, lm_tiles=T_LM, max_seq_supported=MAX_SEQ_SUPPORTED,
+                    trace_build=False, phase_tiles=[T_QKV, T_ATTN, T_O, T_GU, T_D])
 
     def _args(self, tokens, out_log, n_pre, total, start_pos, eos, grid, stream):
         w, lm = self.w, self.w["lm_head"]
@@ -1206,8 +1220,8 @@ class CuteDslMegakernel:
         return self._compiled[use_clc]
 
     def generate(self, tokens, n_prompt, max_new, start_pos, eos, sched_mode, out_log):
-        if sched_mode == 3:
-            raise ValueError("oneshot test mode is only implemented in the CUDA backend")
+        if sched_mode in (3, 4):
+            raise ValueError("the oneshot and static schedulers are only implemented in the CUDA backend")
         use_clc = self.clc_supported if sched_mode == 0 else sched_mode == 2
         if use_clc and not self.clc_supported:
             raise RuntimeError("CLC needs an sm_100+ GPU")

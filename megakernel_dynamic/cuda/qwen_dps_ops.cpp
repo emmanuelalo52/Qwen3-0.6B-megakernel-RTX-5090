@@ -6,7 +6,7 @@
 
 namespace {
 
-constexpr int kAbiVersion = 2;
+constexpr int kAbiVersion = 4;
 
 void check_cuda(const torch::Tensor &t, const char *name) {
     TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
@@ -36,13 +36,19 @@ py::dict info(int64_t weight_format) {
     d["tiles_per_step"] = i.tiles_per_step;
     d["lm_tiles"] = i.lm_tiles;
     d["max_seq_supported"] = i.max_seq_supported;
+    d["trace_build"] = static_cast<bool>(i.trace_build);
+    py::list phase_tiles;
+    for (int t : i.phase_tiles) phase_tiles.append(t);
+    d["phase_tiles"] = phase_tiles;
     return d;
 }
 
 // Runs prompt prefill + max_new greedy decode steps in a single kernel launch.
 // tokens[:n_prompt] holds the prompt; generated ids land in output_log (and are
 // fed back through tokens[n_prompt:]). layer_table is [28 x 25] int64 (see
-// QwenDpsLayerWeights). lm_scale may be empty for fp16 weights.
+// QwenDpsLayerWeights). lm_scale may be empty for fp16 weights. trace is empty, or a
+// uint8 [n, 48] buffer of QwenDpsTraceRecord for tickets trace_first .. trace_first + n
+// (DPS_TRACE builds only).
 // Returns (scheduler mode used, grid CTAs).
 std::tuple<int64_t, int64_t> generate(
     torch::Tensor tokens, int64_t n_prompt, int64_t max_new, int64_t start_pos,
@@ -51,7 +57,7 @@ std::tuple<int64_t, int64_t> generate(
     torch::Tensor lm_head, torch::Tensor lm_scale, double lm_gscale,
     torch::Tensor cos_table, torch::Tensor sin_table,
     torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor workspace,
-    torch::Tensor output_log, double attn_scale) {
+    torch::Tensor output_log, double attn_scale, torch::Tensor trace, int64_t trace_first) {
     check_cuda(tokens, "tokens");
     check_cuda(output_log, "output_log");
     check_cuda(workspace, "workspace");
@@ -69,6 +75,11 @@ std::tuple<int64_t, int64_t> generate(
                 layer_table.numel() * 8 == 28 * static_cast<int64_t>(sizeof(QwenDpsLayerWeights)),
                 "layer_table must be 28 x 25 int64");
     TORCH_CHECK(weight_format == QWEN_DPS_FP16 || lm_scale.numel() > 0, "quantized lm_head needs scales");
+    if (trace.numel() > 0) {
+        check_cuda(trace, "trace");
+        TORCH_CHECK(trace.dtype() == torch::kUInt8 && trace.numel() % sizeof(QwenDpsTraceRecord) == 0,
+                    "trace must be a uint8 buffer of 48-byte records");
+    }
     for (const auto &[t, name] : {std::pair{embed, "embed"}, {lm_head, "lm_head"}, {workspace, "workspace"},
                                   {layer_table, "layer_table"}, {k_cache, "k_cache"}, {v_cache, "v_cache"}})
         check_aligned(t, name);
@@ -95,6 +106,11 @@ std::tuple<int64_t, int64_t> generate(
     a.sched_mode     = static_cast<int>(sched_mode);
     a.weight_format  = static_cast<int>(weight_format);
     a.attn_scale     = static_cast<float>(attn_scale);
+    if (trace.numel() > 0) {
+        a.trace       = reinterpret_cast<QwenDpsTraceRecord *>(trace.data_ptr());
+        a.trace_first = static_cast<int>(trace_first);
+        a.trace_count = static_cast<int>(trace.numel() / sizeof(QwenDpsTraceRecord));
+    }
 
     int used_mode = 0;
     long long grid = 0;

@@ -275,11 +275,16 @@ def mat_gscale(c, layer, m):
 
 
 def fetch_work(c, work_pipe, cons):
-    """consumer_wait + read ticket + consumer_release (cf. get_current_work)."""
+    """consumer_wait + read ticket + consumer_release (cf. get_current_work).
+
+    The caller advances `cons` itself, in the loop body: the DSL carries a value into
+    the next iteration of a dynamic loop only if the body assigns it or calls a method
+    on it, and an object mutated inside a helper is neither. With the advance in here,
+    every iteration re-read the same ring slot, which duplicated and dropped tickets
+    and let the load and compute warps disagree on tiles until the kernel deadlocked."""
     work_pipe.consumer_wait(cons)
     t = c.work[cons.index]
     work_pipe.consumer_release(cons)
-    cons.advance()
     return t
 
 
@@ -634,6 +639,7 @@ class QwenDpsKernel:
         policy = l2_evict_first_policy()
         wbuf_addr = c.wbuf.iterator.toint()
         t = fetch_work(c, work_pipe, cons)
+        cons.advance()
         while t >= 0:
             step, layer, phase, idx = self.decode_tile(c, t)
             nch = Int32(1)
@@ -657,6 +663,7 @@ class QwenDpsKernel:
                         bulk_g2s(dst + d3, s3, n3, full.toint(), policy)
                 ws_idx, ws_ph = ring_next(ws_idx, ws_ph, 1, self.W)
             t = fetch_work(c, work_pipe, cons)
+            cons.advance()
 
     # compute warps
     @cute.jit
@@ -1140,6 +1147,7 @@ class QwenDpsKernel:
         ws_idx = Int32(0)
         ws_ph = Int32(0)
         t = fetch_work(c, work_pipe, cons)
+        cons.advance()
         while t >= 0:
             step, layer, phase, idx = self.decode_tile(c, t)
             if c.tid == 0:
@@ -1162,6 +1170,7 @@ class QwenDpsKernel:
                 nch = Int32(LM_CHUNKS)
             ws_idx, ws_ph = ring_next(ws_idx, ws_ph, nch, self.W)
             t = fetch_work(c, work_pipe, cons)
+            cons.advance()
 
 
 # host wrapper

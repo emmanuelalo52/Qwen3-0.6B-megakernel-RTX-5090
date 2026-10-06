@@ -38,6 +38,8 @@ qwen_megakernel/
 ├── setup.py                    # Build script for CUDA extension
 ├── serve.sh                    # vLLM baseline server launcher
 ├── client_benchmark.py         # Benchmark client (OpenAI SDK)
+├── compare_benchmarks.py       # Markdown comparison of client logs (speedups vs a baseline)
+├── bench_serving.sh            # B200: serve megakernel configs and vLLM in turn, benchmark, compare
 ├── prompt.py                   # 100 benchmark prompts
 ├── rmsnorm.cuh / rmsnorm.cu    # RMSNorm CUDA kernel
 ├── swiglu.cuh / swiglu.cu      # SwiGLU CUDA kernel
@@ -47,7 +49,10 @@ qwen_megakernel/
 └── megakernel_dynamic/         # B200 rebuild: CLC dynamic persistent scheduler, fp16/fp8/fp4
     ├── README.md               # Design notes, verification status, tuning knobs
     ├── qwen_dps.py             # DpsDecoder: weight loading, MXF8/NVF4 quantization, generate()
+    ├── serve_dps.py            # OpenAI-compatible server for the dynamic megakernel
     ├── test_dps.py             # Token-level check against HF transformers + latency
+    ├── trace_dps.py            # Per-tile timeline (DPS_TRACE build)
+    ├── hang_probe.py           # Progress counters of a hung CuTeDSL launch
     ├── cuda/                   # CUDA C++ version (dps_scheduler.cuh, qwen_dps_megakernel.cu, setup.py)
     └── cutedsl/                # CuTeDSL version (qwen_dps_cutedsl.py)
 ```
@@ -437,9 +442,12 @@ Sends 100 requests from `prompt.py` to whichever server is pointed to by `HOST` 
 
 ### Metrics reported
 
-- Average, median, standard deviation, min, max latency
+- Average, median, P90, standard deviation, min, max latency
 - Throughput in requests/second
-- All results saved to a JSON log file (configurable via `LOG_FILE` in `.env`)
+- Output tokens (the server's `usage.completion_tokens`), tokens/s per request (mean of output tokens / latency), end-to-end tokens/s (all output tokens / all request time), and wall time
+- All results saved to a JSON log file (configurable via `LOG_FILE` in `.env`), with each answer and its `finish_reason`
+
+Options (environment or `.env`): `SERVER_LABEL` names the server in the log, and `WARMUP` sends that many untimed requests first. `compare_benchmarks.py` turns two or more logs into the comparison table.
 
 ---
 
@@ -568,6 +576,49 @@ These are not comparable with the RTX 5090 table at the top: different GPU, diff
 Per-tile traces (`megakernel_dynamic/trace_dps.py`) show where the time goes. Weights are always in shared memory before a tile needs them, a tile computes in ~1.5-1.9 us, and phases hand off in ~0.25 us. But the SMs spend 56-69% of each step waiting on dependencies, because claiming 6-12 tiles ahead hands each phase's tiles out unevenly: the busiest SM gets 2-3x its share and the phase waits for it. Claiming one tile ahead (`DPS_SSTAGES=1`) cut the step by 25% (fp16) and 35% (fp4). Full tables: [`megakernel_dynamic/README.md`](megakernel_dynamic/README.md#b200-benchmarks).
 
 Since this run, the kernel claims one tile ahead by default, every phase fits in one round of tiles across the B200's 148 SMs, and a `static` scheduler mode gives each SM exactly one tile per phase. None of that has been measured on a B200 yet: [changes since the B200 run](megakernel_dynamic/README.md#changes-since-the-b200-run).
+
+### Serving benchmark against vLLM (B200)
+
+The same comparison as the RTX 5090 table: an OpenAI-compatible server for each, the 100
+prompts from `prompt.py` sent one at a time by `client_benchmark.py`, greedy decoding with
+thinking disabled. `megakernel_dynamic/serve_dps.py` is the dynamic megakernel's server.
+Both servers get token-identical prompts (checked for all 100), stop at `<|im_end|>`, and
+count it as an output token, so tokens/s compares like with like.
+
+vLLM pins its own PyTorch, which differs from the CUDA 13 build the megakernel needs, so give
+it its own environment on the B200:
+
+```bash
+uv venv /venv/vllm --python 3.12 && uv pip install --python /venv/vllm/bin/python vllm
+```
+
+```bash
+pip install fastapi uvicorn openai orjson
+```
+
+Then, with the megakernel built (see above), from the repository root:
+
+```bash
+VLLM_BIN=/venv/vllm/bin/vllm bash bench_serving.sh
+```
+
+It serves each megakernel configuration (`DPS_CONFIGS`, default fp16, fp8 and fp4 with the
+default scheduler) and vLLM twice: `--enforce-eager` as in the RTX 5090 comparison, and with
+CUDA graphs, vLLM's default and the stronger baseline. Each server gets 3 untimed warm-up
+requests, then the 100 timed ones (`MAX_TOKENS=32` as in the 5090 table). The logs and
+`comparison.md` land in `megakernel_dynamic/results/serving_<date>/`. To compare any two
+logs by hand:
+
+```bash
+python compare_benchmarks.py --baseline <vllm log> <megakernel log>
+```
+
+The table reports average, median and P90 latency, tokens/s (per request), end-to-end
+throughput (all output tokens / all request time), req/s and the min-max spread, each with
+its speedup over the baseline. Below it, the script checks the runs are comparable: same
+settings and prompts, how many answers match vLLM's word for word, and whether both servers
+counted output tokens the same way. Note that fp8/fp4 megakernel runs still face an fp16
+vLLM, so they compare speed at different precision.
 
 ### Status
 

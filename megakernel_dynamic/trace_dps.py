@@ -28,21 +28,23 @@ from qwen_dps import TRACE_FIELDS, DpsDecoder, first_ticket  # noqa: E402
 # Tile graph, mirrors qwen_dps_megakernel.cu.
 NL = 28
 PHASES = ["QKV", "ATTN", "O-proj", "gate/up", "down", "LM head"]
-PHASE_TILES = [256, 64, 128, 384, 256]
-T_LAYER = sum(PHASE_TILES)
-PHASE_BOUNDS = np.cumsum(PHASE_TILES)
+# Tiles per layer (QKV, ATTN, O, gate/up, down) of traces saved before the build reported
+# them: the original tile sizes, used for the first B200 traces in results/traces/.
+ORIGINAL_PHASE_TILES = [256, 64, 128, 384, 256]
 TRACE_DTYPE = np.dtype(TRACE_FIELDS)
 
 
-def decode_tiles(tickets, n_pre, t_step, t_lm):
+def decode_tiles(tickets, n_pre, t_step, t_lm, phase_tiles):
     """Ticket -> (step, layer, phase), as decode_tile() does on the GPU."""
+    t_layer = sum(phase_tiles)
+    bounds = np.cumsum(phase_tiles)
     pre = n_pre * t_step
     dec = tickets >= pre
     step = np.where(dec, n_pre + (tickets - pre) // (t_step + t_lm), tickets // t_step)
     rem = np.where(dec, tickets - pre - (step - n_pre) * (t_step + t_lm), tickets - step * t_step)
     lm = rem >= t_step
-    layer = np.where(lm, NL, rem // T_LAYER)
-    phase = np.where(lm, 5, np.searchsorted(PHASE_BOUNDS, rem - layer * T_LAYER, side="right"))
+    layer = np.where(lm, NL, rem // t_layer)
+    phase = np.where(lm, 5, np.searchsorted(bounds, rem - layer * t_layer, side="right"))
     return step, layer, phase
 
 
@@ -55,7 +57,8 @@ def analyse(rec, meta):
     tickets = int(meta["first_ticket"]) + np.arange(len(rec))
     ok = rec["end"] > 0   # tiles the kernel never ran (early stop) keep zeros
     rec, tickets = rec[ok], tickets[ok]
-    step, layer, phase = decode_tiles(tickets, n_pre, t_step, t_lm)
+    phase_tiles = [int(x) for x in meta.get("phase_tiles", ORIGINAL_PHASE_TILES)]
+    step, layer, phase = decode_tiles(tickets, n_pre, t_step, t_lm, phase_tiles)
     steps = np.unique(step)
     t = {k: rec[k].astype(np.int64) for k in ("claim", "start", "ready", "end")}
     prep, wwait = rec["prep_ns"].astype(np.int64), rec["wwait_ns"].astype(np.int64)
@@ -118,9 +121,27 @@ def analyse(rec, meta):
               f"{us(np.mean(seg[ph]))}  {us(np.mean(hand[ph]))}  {us(np.mean(spread[ph]))}")
     print(f"  {'sum':<9} {'':>12} {total / 1e3:9.1f}")
 
-    # 3. What the SMs do over the traced window.
-    lo, hi = t["start"].min(), t["end"].max()
+    # 3. Hand-out balance: a phase lasts about as long as its busiest SM needs.
     n_sm = len(np.unique(rec["sm"]))
+    print(f"\nbalance (mean per phase)  tiles  even share  busiest SM  SMs used  phase duration us")
+    for ph in range(5):
+        busiest, used, dur, n = [], [], [], 0
+        for s in steps:
+            for L in range(NL):
+                k = (phase == ph) & (step == s) & (layer == L)
+                if not k.any():
+                    continue
+                per_sm = np.bincount(rec["sm"][k])
+                busiest.append(per_sm.max())
+                used.append((per_sm > 0).sum())
+                dur.append((t["end"][k].max() - t["ready"][k].min()) / 1e3)
+                n = k.sum()
+        if busiest:
+            print(f"  {PHASES[ph]:<9} {n:>21} {n / n_sm:11.2f} {np.mean(busiest):11.2f} {np.mean(used):9.0f} "
+                  f"{np.mean(dur):18.2f}")
+
+    # 4. What the SMs do over the traced window.
+    lo, hi = t["start"].min(), t["end"].max()
     busy = (t["end"] - t["ready"]).sum() / (n_sm * (hi - lo))
     waiting = (t["ready"] - t["start"]).sum() / (n_sm * (hi - lo))
     order = np.lexsort((t["start"], rec["sm"]))
@@ -161,7 +182,7 @@ def run(args):
         probe = DpsDecoder(weights, tok, sched="atomic", weight_format=fmt, trace=True)
         info = probe.info()
         del probe
-        scheds = [args.sched] if args.sched else (["atomic", "clc"] if info["clc_supported"] else ["atomic"])
+        scheds = [args.sched] if args.sched else ["atomic", "static"] + (["clc"] if info["clc_supported"] else [])
         for sched in scheds:
             untraced = None
             try:   # the same decode on the normal build, to show what tracing costs
@@ -174,6 +195,7 @@ def run(args):
             t_first, raw = dec.last_trace
             meta = dict(label=f"{fmt} {sched}", gpu=torch.cuda.get_device_name(), first_ticket=t_first,
                         n_pre=n_pre, tiles_per_step=info["tiles_per_step"], lm_tiles=info["lm_tiles"],
+                        phase_tiles=np.array(info["phase_tiles"]),
                         untraced_us=untraced or 0.0)
             rec = raw.numpy().reshape(-1).view(TRACE_DTYPE)
             analyse(rec, meta)
@@ -188,7 +210,7 @@ def run(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--formats", default="fp16", help="comma-separated subset of fp16,fp8,fp4")
-    ap.add_argument("--sched", default=None, choices=["atomic", "clc"], help="default: every supported mode")
+    ap.add_argument("--sched", default=None, choices=["atomic", "static", "clc"], help="default: every supported mode")
     ap.add_argument("--skip", type=int, default=16, help="decode steps before the traced ones")
     ap.add_argument("--steps", type=int, default=8, help="decode steps to trace (at least 2)")
     ap.add_argument("--out-dir", default=None, help="save each trace as <format>_<sched>.npz")
@@ -200,7 +222,8 @@ def main():
     if args.load:
         for path in args.load:
             z = np.load(path)
-            analyse(z["records"], {k: z[k].item() for k in z.files if k != "records"})
+            analyse(z["records"], {k: z[k].item() if z[k].ndim == 0 else z[k].tolist()
+                                   for k in z.files if k != "records"})
     else:
         run(args)
 

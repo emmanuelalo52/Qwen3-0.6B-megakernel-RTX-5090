@@ -567,9 +567,11 @@ These are not comparable with the RTX 5090 table at the top: different GPU, diff
 
 Per-tile traces (`megakernel_dynamic/trace_dps.py`) show where the time goes. Weights are always in shared memory before a tile needs them, a tile computes in ~1.5-1.9 us, and phases hand off in ~0.25 us. But the SMs spend 56-69% of each step waiting on dependencies, because claiming 6-12 tiles ahead hands each phase's tiles out unevenly: the busiest SM gets 2-3x its share and the phase waits for it. Claiming one tile ahead (`DPS_SSTAGES=1`) cut the step by 25% (fp16) and 35% (fp4). Full tables: [`megakernel_dynamic/README.md`](megakernel_dynamic/README.md#b200-benchmarks).
 
+Since this run, the kernel claims one tile ahead by default, every phase fits in one round of tiles across the B200's 148 SMs, and a `static` scheduler mode gives each SM exactly one tile per phase. None of that has been measured on a B200 yet: [changes since the B200 run](megakernel_dynamic/README.md#changes-since-the-b200-run).
+
 ### Status
 
-Verified on a B200 (CUDA version): greedy tokens match HF transformers exactly for fp16, and for fp8/fp4 they match HF running the dequantized weights, with both the CLC and atomic schedulers. The kernel is still latency-bound, far from the weight-bandwidth floor (~144 us per step at fp16), so there is more to gain. The CuTeDSL version deadlocks on B200: some tiles skip their dependency wait. It is still being debugged. Details and raw logs: [`megakernel_dynamic/README.md`](megakernel_dynamic/README.md#verification-status).
+Verified on a B200 (CUDA version): greedy tokens match HF transformers exactly for fp16, and for fp8/fp4 they match HF running the dequantized weights, with both the CLC and atomic schedulers. The kernel is still latency-bound, far from the weight-bandwidth floor (~144 us per step at fp16), so there is more to gain. The CuTeDSL version deadlocked on B200. The cause was a CuTeDSL tracing pitfall: the work ring's position was advanced inside a helper function, which the DSL does not carry into the next loop iteration, so the warps kept re-reading one ring slot. That is fixed and compiles, but has not run on a B200 yet. Details and raw logs: [`megakernel_dynamic/README.md`](megakernel_dynamic/README.md#verification-status).
 
 ---
 

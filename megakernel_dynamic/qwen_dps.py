@@ -32,8 +32,8 @@ NUM_KV_HEADS = 8
 HEAD_DIM = 128
 MAX_SEQ_LEN = 2048
 ROPE_THETA = 1_000_000.0
-SCHED_MODES = {"auto": 0, "atomic": 1, "clc": 2, "oneshot": 3}
-SCHED_NAMES = {1: "atomic", 2: "clc", 3: "oneshot"}
+SCHED_MODES = {"auto": 0, "atomic": 1, "clc": 2, "oneshot": 3, "static": 4}
+SCHED_NAMES = {1: "atomic", 2: "clc", 3: "oneshot", 4: "static"}
 WEIGHT_FORMATS = {"fp16": 0, "fp8": 1, "fp4": 2}
 
 # One projection matrix: data [rows, K] (fp16 | e4m3 bytes | packed e2m1),

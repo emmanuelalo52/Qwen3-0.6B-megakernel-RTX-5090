@@ -61,7 +61,7 @@ struct QwenDpsLaunch {
     int   start_pos;                        // KV position of tokens[0]
     int   max_seq;
     int   eos_token;                        // -1 disables early stop
-    int   sched_mode;                       // 0 auto, 1 atomic, 2 CLC, 3 oneshot (test)
+    int   sched_mode;                       // 0 auto, 1 atomic, 2 CLC, 3 oneshot (test), 4 static
     int   weight_format;                    // QwenDpsWeightFormat
     float attn_scale;
     QwenDpsTraceRecord *trace;              // nullptr = no tracing (needs a DPS_TRACE build)
@@ -82,10 +82,11 @@ struct QwenDpsInfo {
     int       lm_tiles;
     int       max_seq_supported;
     int       trace_build;         // built with DPS_TRACE=1
+    int       phase_tiles[5];      // tiles per layer: QKV, attention, O-proj, gate/up, down
 };
 
 extern "C" size_t qwen_dps_workspace_bytes();
 extern "C" cudaError_t qwen_dps_info(int weight_format, QwenDpsInfo *info);
-// Returns the scheduler mode actually used (1 atomic, 2 CLC, 3 oneshot) and grid size.
+// Returns the scheduler mode actually used (1 atomic, 2 CLC, 3 oneshot, 4 static) and grid size.
 extern "C" cudaError_t qwen_dps_launch(const QwenDpsLaunch *args, cudaStream_t stream,
                                        int *used_mode, long long *grid_ctas);

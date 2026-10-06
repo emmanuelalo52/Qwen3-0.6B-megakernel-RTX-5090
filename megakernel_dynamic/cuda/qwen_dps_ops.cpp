@@ -6,7 +6,7 @@
 
 namespace {
 
-constexpr int kAbiVersion = 3;
+constexpr int kAbiVersion = 4;
 
 void check_cuda(const torch::Tensor &t, const char *name) {
     TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
@@ -37,6 +37,9 @@ py::dict info(int64_t weight_format) {
     d["lm_tiles"] = i.lm_tiles;
     d["max_seq_supported"] = i.max_seq_supported;
     d["trace_build"] = static_cast<bool>(i.trace_build);
+    py::list phase_tiles;
+    for (int t : i.phase_tiles) phase_tiles.append(t);
+    d["phase_tiles"] = phase_tiles;
     return d;
 }
 
